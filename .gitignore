@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 排除权重与数据
+*.pt
+*.pth
+*.ckpt
+data/
+outputs/
+renders/
+logs/
+
+# 排除 Python 缓存
+__pycache__/
+.venv/
+*.egg-info/
