@@ -28,6 +28,7 @@ import tyro
 from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig, ScaledCameraOptimizerConfig
 from nerfstudio.configs.base_config import LoggingConfig, ViewerConfig
 from nerfstudio.configs.external_methods import ExternalMethodDummyTrainerConfig, get_external_methods
+from nerfstudio.models.cosplat import SplatADModelConfig
 from nerfstudio.data.datamanagers.ad_datamanager import ADDataManagerConfig
 from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanagerConfig
 from nerfstudio.data.datamanagers.full_images_lidar_datamanager import FullImageLidarDatamanagerConfig
