@@ -390,6 +390,80 @@ method_configs["splatad"] = TrainerConfig(
     vis="viewer",
 )
 
+method_configs["cosplat"] = TrainerConfig(
+    method_name="cosplat",
+    steps_per_eval_image=500, steps_per_eval_batch=0,
+    steps_per_save=2000, steps_per_eval_all_images=2500,
+    max_num_iterations=30001, mixed_precision=False,
+    pipeline=SplatADPipelineConfig(
+        calc_fid_steps=(30000,),
+        datamanager=FullImageLidarDatamanagerConfig(
+            dataparser=PandaSetDataParserConfig(add_missing_points=True),
+            cache_images_type="uint8",
+        ),
+        model=SplatADModelConfig(max_steps=30001),
+    ),
+    optimizers={
+        "means": {
+            "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1.6e-6, max_steps=30000),
+        },
+        "features_dc": {
+            "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
+            "scheduler": None,
+        },
+        "features_rest": {
+            "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
+            "scheduler": None,
+        },
+        "opacities": {
+            "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
+            "scheduler": None,
+        },
+        "scales": {
+            "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
+            "scheduler": None,
+        },
+        "quats": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
+        "camera_opt": {
+            "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-7, max_steps=30000),
+        },
+        "camera_velocity_opt_linear": {
+            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-6, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0),
+        },
+        "camera_velocity_opt_angular": {
+            "optimizer": AdamOptimizerConfig(lr=2e-4, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-7, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0),
+        },
+        "camera_velocity_opt_time_to_center_pixel": {
+            "optimizer": AdamOptimizerConfig(lr=2e-4, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-7, max_steps=30000, warmup_steps=10000, lr_pre_warmup=0),
+        },
+        "trajectory_opt": {
+            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=20001, warmup_steps=2500),
+        },
+        "fields": {
+            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15, weight_decay=1e-6),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-3, max_steps=20001, warmup_steps=500),
+        },
+        # ── Innovation 1: fog ASM parameters (β + A) ──
+        "fog_params": {
+            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=30000),
+        },
+        # ── Innovation 2: LiDAR residual offsets ──
+        "lidar_offsets": {
+            "optimizer": AdamOptimizerConfig(lr=8e-5, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=8e-7, max_steps=30000),
+        },
+    },
+    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
+    vis="viewer",
+)
+
 method_configs["neurad"] = TrainerConfig(
     method_name="neurad",
     steps_per_eval_batch=500,
