@@ -54,6 +54,7 @@ descriptions = {
     "neurad": "Continuously improving version of NeuRAD.",
     "neurad-paper": "NeuRAD with settings matching the paper.",
     "splatad": "Gaussian Splatting model for autonomous driving",
+    "cosplat": "Gaussian Splatting model with dual-stream dehazing for autonomous driving",
 }
 
 method_configs["nerfacto"] = TrainerConfig(
