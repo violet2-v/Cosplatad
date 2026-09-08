@@ -40,7 +40,7 @@ CoSplat is registered as a standalone method (`ns-train cosplat ...`) that reuse
 
 [June 2025] Code for [SplatAD](https://research.zenseact.com/publications/splatad/) released in neurad-studio. Uses our custom [gsplat fork](https://github.com/carlinds/splatad). Apptainer users: see [`apptainer_recipe`](apptainer_recipe).
 
-[June 2025] **CoSplat** added — zero‑shot fog removal for autonomous driving via bias‑driven per‑Gaussian ASM + LiDAR residual offsets.
+[2025] **CoSplat** added — zero‑shot fog removal for autonomous driving via bias‑driven per‑Gaussian ASM + LiDAR residual offsets.
 
 # Quickstart
 
@@ -48,14 +48,14 @@ CoSplat is registered as a standalone method (`ns-train cosplat ...`) that reuse
 
 ### Prerequisites
 
-NVIDIA GPU with CUDA 11.8. See [CUDA install guide](https://docs.nvidia.com/cuda/cuda-quick-start-guide/index.html).
+NVIDIA GPU with CUDA 11.7/11.8. See [CUDA install guide](https://docs.nvidia.com/cuda/cuda-quick-start-guide/index.html).
 
 ### Create environment
 
 ```bash
 conda create --name neurad -y python=3.10
 conda activate neurad
-pip install --upgrade pip "setuptools<70.0"
+pip install --upgrade pip
 ```
 
 ### Dependencies
@@ -65,13 +65,14 @@ pip install --upgrade pip "setuptools<70.0"
 pip install torch==2.0.1+cu118 torchvision==0.15.2+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
 conda install -c "nvidia/label/cuda-11.8.0" cuda-toolkit
 pip install dill --upgrade
+pip install --upgrade pip "setuptools<70.0"
 pip install ninja git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
 ```
 
 ### Install neurad-studio
 
 ```bash
-git clone https://github.com/<your-username>/neurad-studio.git
+git clone https://github.com/你的用户名/neurad-studio.git
 cd neurad-studio
 pip install -e .
 ```
@@ -102,10 +103,10 @@ python scripts/add_fog_nuscenes.py \
 
 ### Training commands
 
-All models use the standard `ns-train` interface. CoSplat is registered as a separate method.
+CoSplat is registered as a standalone method that inherits the full `splatad` pipeline and optimizer configuration.
 
 ```bash
-# Train vanilla SplatAD
+# Train vanilla SplatAD (no fog)
 ns-train splatad pandaset-data --data data/pandaset
 
 # Train CoSplat (zero-shot dehazing, β=0.01 light fog)
@@ -128,7 +129,7 @@ Two independent toggles allow systematic evaluation:
 ns-train cosplat pandaset-data --data data/pandaset_fog --sequence 001 \
     --pipeline.model.use-dual-stream False --pipeline.model.use-lidar-offset False
 
-# +ASM only (Innovation 1 — per‑Gaussian transmission map)
+# +ASM only (Innovation 1 — per-Gaussian transmission map)
 ns-train cosplat pandaset-data --data data/pandaset_fog --sequence 001 \
     --pipeline.model.use-dual-stream True --pipeline.model.use-lidar-offset False
 
@@ -136,8 +137,9 @@ ns-train cosplat pandaset-data --data data/pandaset_fog --sequence 001 \
 ns-train cosplat pandaset-data --data data/pandaset_fog --sequence 001 \
     --pipeline.model.use-dual-stream False --pipeline.model.use-lidar-offset True
 
-# Full model (both innovations)
-ns-train cosplat pandaset-data --data data/pandaset_fog --sequence 001
+# Full model (both innovations, β=0.01)
+ns-train cosplat pandaset-data --data data/pandaset_fog --sequence 001 \
+    --pipeline.model.fog-beta-init 0.04 --pipeline.model.fog-beta-min 0.03
 ```
 
 Expected ablation results (PandaSet, β=0.01):
@@ -148,8 +150,6 @@ Expected ablation results (PandaSet, β=0.01):
 | +ASM only | 19.29 | 0.749 | 0.237 |
 | +Offset only | 13.71 | 0.696 | 0.285 |
 | Full model | 19.54 | 0.752 | 0.236 |
-
-The +0.25 dB improvement from ASM‑only to Full is consistent with the expected feedback loop: LiDAR offsets absorb sensor-specific errors, allowing the shared Gaussian means to better fit camera geometry, which in turn yields more accurate per‑Gaussian depth and a cleaner ASM decomposition.
 
 ## 3. Evaluation
 
@@ -173,7 +173,7 @@ Output: `dehaze_metrics.json`, 4‑panel visual comparisons, and a `summary_grid
 
 ## 4. CoSplat
 
-CoSplat achieves zero‑shot dehazing on foggy autonomous driving data through two architectural innovations, both implemented as modifications to `splatad.py`:
+CoSplat achieves zero‑shot dehazing on foggy autonomous driving data through two architectural innovations:
 
 **Innovation 1 — Per‑Gaussian Atmospheric Scattering Model**
 
@@ -185,11 +185,11 @@ Training uses only foggy images + LiDAR. At inference, the environment stream is
 
 **Bias‑driven training**: The scattering coefficient lower bound $\beta_{\min}$ is set above the true fog density (≈2‑3×) to prevent the ASM decomposition from collapsing to the trivial solution $\beta \to 0$. This forces the CNN decoder to output cleaner colors.
 
-**Innovation 2 — Per‑Gaussian LiDAR Residual Offsets**
+**Innovation 2 — Hierarchical LiDAR Residual Offsets**
 
 LiDAR renders use $\mu + \Delta\mu_{\text{offset}}$ while camera shares the backbone mean $\mu$. The learnable offsets absorb calibration errors and penetration noise (e.g., through glass) with minimal memory overhead — 3 extra floats per Gaussian.
 
-### Key fog parameters (in SplatADModelConfig)
+### Key fog parameters
 
 | Parameter | Recommended (β=0.01) | Description |
 | --- | --- | --- |
@@ -203,7 +203,7 @@ LiDAR renders use $\mu + \Delta\mu_{\text{offset}}$ while camera shares the back
 
 For β=0.02 moderate fog, change only `fog_beta_init=0.05` and `fog_beta_min=0.04`. All other parameters stay identical.
 
-### Dehazing results (from the CoSplat paper)
+### Dehazing results
 
 | Dataset, β | Method | PSNR↑ | SSIM↑ | LPIPS↓ |
 | --- | --- | --- | --- | --- |
@@ -218,9 +218,10 @@ For β=0.02 moderate fog, change only `fog_beta_init=0.05` and `fog_beta_min=0.0
 
 CoSplat consistently improves PSNR by ≈5 dB across both datasets and fog densities, without ever seeing a clean image during training.
 
-### Limitations (from the paper)
+### Limitations
 
 - Residual haze on object boundaries due to alpha‑blending of multiple Gaussian transmissions in $t_{\text{map}}$. Can be mitigated by higher Gaussian density or LiDAR true‑depth supervision.
+- Sky regions rely on sparse Gaussian coverage; extreme lighting may introduce color artefacts.
 - Real fog has spatial non‑uniformity not captured by a global $\beta$. Extending β to a spatially‑adaptive parameter is future work.
 
 # Available models
@@ -245,9 +246,6 @@ All trained via `ns-train <method> pandaset-data --data <path>`.
 
 # Built On
 
-- [nerfstudio](https://github.com/nerfstudio-project/nerfstudio) — the underlying framework
-- [SplatAD gsplat fork](https://github.com/carlinds/splatad) — custom rasterization with LiDAR support
-
 # Citation
 
 ```bibtex
@@ -262,14 +260,8 @@ All trained via `ns-train <method> pandaset-data --data <path>`.
   author={Hess, Georg and Lindstr{\"o}m, Carl and Fatemi, Maryam and Petersson, Christoffer and Svensson, Lennart},
   booktitle={CVPR}, year={2025}
 }
-
-@inproceedings{cosplat2025,
-  title={{CoSplat}: Zero-Shot Dehazing for Autonomous Driving via Per-Gaussian Atmospheric Scattering},
-  author={TBD},
-  booktitle={CVPR},
-  year={2025},
-  note={to appear}
-}
 ```
 
 If you use the CoSplat extension, please cite the CoSplat paper (to appear).
+
+---
