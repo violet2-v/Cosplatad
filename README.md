@@ -157,7 +157,7 @@ Dedicated evaluation scripts compare the dehazed output against clean ground‑t
 
 ```bash
 # PandaSet
-python eval_dehaze_full.py \
+python eval_dehaze_pandaset.py \
     --load-config outputs/cosplat/EXP_NAME/config.yml \
     --clean-gt-dir data/pandaset/001 \
     --output-dir ./eval_results/ --max-vis 10
