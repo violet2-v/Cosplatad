@@ -28,7 +28,6 @@ import tyro
 from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig, ScaledCameraOptimizerConfig
 from nerfstudio.configs.base_config import LoggingConfig, ViewerConfig
 from nerfstudio.configs.external_methods import ExternalMethodDummyTrainerConfig, get_external_methods
-from nerfstudio.models.cosplat import SplatADModelConfig
 from nerfstudio.data.datamanagers.ad_datamanager import ADDataManagerConfig
 from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanagerConfig
 from nerfstudio.data.datamanagers.full_images_lidar_datamanager import FullImageLidarDatamanagerConfig
@@ -41,6 +40,7 @@ from nerfstudio.models.lidar_nerfacto import LidarNerfactoModelConfig
 from nerfstudio.models.nerfacto import NerfactoModelConfig
 from nerfstudio.models.neurad import NeuRADModelConfig
 from nerfstudio.models.splatad import SplatADModelConfig
+from nerfstudio.models.cosplat import SplatADModelConfig as CoSplatModelConfig
 from nerfstudio.models.splatfacto import SplatfactoModelConfig
 from nerfstudio.pipelines.ad_pipeline import ADPipelineConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
@@ -50,7 +50,7 @@ from nerfstudio.plugins.registry import discover_methods
 method_configs: Dict[str, Union[TrainerConfig, ExternalMethodDummyTrainerConfig]] = {}
 descriptions = {
     "nerfacto": "Nerfstudio's default model.",
-    "nerfacto-lidar": "Nerfacto with lidar supervision.",
+    "nerfacto-lidar": "Nerfstudio with lidar supervision.",
     "splatfacto": "Gaussian Splatting model for static scenes",
     "neurad": "Continuously improving version of NeuRAD.",
     "neurad-paper": "NeuRAD with settings matching the paper.",
@@ -60,7 +60,8 @@ descriptions = {
 
 method_configs["nerfacto"] = TrainerConfig(
     method_name="nerfacto",
-    steps_per_eval_batch=500,
+    steps_per_eval_batch=100,
+    steps_per_eval_image=500,
     steps_per_save=2000,
     max_num_iterations=30000,
     mixed_precision=True,
@@ -96,7 +97,8 @@ method_configs["nerfacto"] = TrainerConfig(
 
 method_configs["nerfacto-big"] = TrainerConfig(
     method_name="nerfacto",
-    steps_per_eval_batch=500,
+    steps_per_eval_batch=200,
+    steps_per_eval_image=500,
     steps_per_save=2000,
     max_num_iterations=100000,
     mixed_precision=True,
@@ -140,14 +142,15 @@ method_configs["nerfacto-big"] = TrainerConfig(
 
 method_configs["nerfacto-huge"] = TrainerConfig(
     method_name="nerfacto",
-    steps_per_eval_batch=500,
+    steps_per_eval_batch=200,
+    steps_per_eval_image=500,
     steps_per_save=2000,
     max_num_iterations=100000,
     mixed_precision=True,
     pipeline=VanillaPipelineConfig(
         datamanager=ParallelDataManagerConfig(
             dataparser=PandaSetDataParserConfig(),
-            train_num_rays_per_batch=16384,
+            train_num_rays_per_batch=8192,
             eval_num_rays_per_batch=4096,
         ),
         model=NerfactoModelConfig(
@@ -188,7 +191,8 @@ method_configs["nerfacto-huge"] = TrainerConfig(
 
 method_configs["nerfacto-lidar"] = TrainerConfig(
     method_name="nerfacto-lidar",
-    steps_per_eval_batch=500,
+    steps_per_eval_batch=200,
+    steps_per_eval_image=500,
     steps_per_save=2000,
     max_num_iterations=30000,
     mixed_precision=True,
@@ -221,7 +225,7 @@ method_configs["nerfacto-lidar"] = TrainerConfig(
 method_configs["splatfacto"] = TrainerConfig(
     method_name="splatfacto",
     steps_per_eval_image=100,
-    steps_per_eval_batch=0,
+    steps_per_eval_batch=100,
     steps_per_save=2000,
     steps_per_eval_all_images=1000,
     max_num_iterations=30000,
@@ -236,27 +240,12 @@ method_configs["splatfacto"] = TrainerConfig(
     optimizers={
         "means": {
             "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(
-                lr_final=1.6e-6,
-                max_steps=30000,
-            ),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1.6e-6, max_steps=30000),
         },
-        "features_dc": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
-            "scheduler": None,
-        },
-        "features_rest": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
-            "scheduler": None,
-        },
-        "opacities": {
-            "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
-            "scheduler": None,
-        },
-        "scales": {
-            "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
-            "scheduler": None,
-        },
+        "features_dc": {"optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15), "scheduler": None},
+        "features_rest": {"optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15), "scheduler": None},
+        "opacities": {"optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15), "scheduler": None},
+        "scales": {"optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15), "scheduler": None},
         "quats": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
         "camera_opt": {
             "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
@@ -270,7 +259,7 @@ method_configs["splatfacto"] = TrainerConfig(
 method_configs["splatfacto-big"] = TrainerConfig(
     method_name="splatfacto",
     steps_per_eval_image=100,
-    steps_per_eval_batch=0,
+    steps_per_eval_batch=100,
     steps_per_save=2000,
     steps_per_eval_all_images=1000,
     max_num_iterations=30000,
@@ -287,27 +276,12 @@ method_configs["splatfacto-big"] = TrainerConfig(
     optimizers={
         "means": {
             "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(
-                lr_final=1.6e-6,
-                max_steps=30000,
-            ),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1.6e-6, max_steps=30000),
         },
-        "features_dc": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
-            "scheduler": None,
-        },
-        "features_rest": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
-            "scheduler": None,
-        },
-        "opacities": {
-            "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
-            "scheduler": None,
-        },
-        "scales": {
-            "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
-            "scheduler": None,
-        },
+        "features_dc": {"optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15), "scheduler": None},
+        "features_rest": {"optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15), "scheduler": None},
+        "opacities": {"optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15), "scheduler": None},
+        "scales": {"optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15), "scheduler": None},
         "quats": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
         "camera_opt": {
             "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
@@ -318,11 +292,17 @@ method_configs["splatfacto-big"] = TrainerConfig(
     vis="viewer",
 )
 
+# ══════════════════════════════════════════════════════════════
+# SplatAD — vanilla baseline (original optimizer configuration)
+# ══════════════════════════════════════════════════════════════
 method_configs["splatad"] = TrainerConfig(
     method_name="splatad",
-    steps_per_eval_image=500, steps_per_eval_batch=0,
-    steps_per_save=2000, steps_per_eval_all_images=2500,
-    max_num_iterations=30001, mixed_precision=False,
+    steps_per_eval_image=500,
+    steps_per_eval_batch=100,
+    steps_per_save=2000,
+    steps_per_eval_all_images=2500,
+    max_num_iterations=30001,
+    mixed_precision=False,
     pipeline=SplatADPipelineConfig(
         calc_fid_steps=(30000,),
         datamanager=FullImageLidarDatamanagerConfig(
@@ -336,22 +316,10 @@ method_configs["splatad"] = TrainerConfig(
             "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
             "scheduler": ExponentialDecaySchedulerConfig(lr_final=1.6e-6, max_steps=30000),
         },
-        "features_dc": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
-            "scheduler": None,
-        },
-        "features_rest": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
-            "scheduler": None,
-        },
-        "opacities": {
-            "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
-            "scheduler": None,
-        },
-        "scales": {
-            "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
-            "scheduler": None,
-        },
+        "features_dc": {"optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15), "scheduler": None},
+        "features_rest": {"optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15), "scheduler": None},
+        "opacities": {"optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15), "scheduler": None},
+        "scales": {"optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15), "scheduler": None},
         "quats": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
         "camera_opt": {
             "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
@@ -377,55 +345,44 @@ method_configs["splatad"] = TrainerConfig(
             "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15, weight_decay=1e-6),
             "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-3, max_steps=20001, warmup_steps=500),
         },
-        # ── Innovation 1: fog ASM parameters (β + A) ──
-        "fog_params": {
-            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=30000),
-        },
-        # ── Innovation 2: LiDAR residual offsets ──
-        "lidar_offsets": {
-            "optimizer": AdamOptimizerConfig(lr=8e-5, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=8e-7, max_steps=30000),
-        },
     },
     viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
     vis="viewer",
 )
 
+# ══════════════════════════════════════════════════════════════
+# CoSplat — zero-shot dehazing (defaults tuned for β=0.01 light fog;
+# override fog-beta-init / fog-beta-min for other densities)
+# ══════════════════════════════════════════════════════════════
 method_configs["cosplat"] = TrainerConfig(
     method_name="cosplat",
-    steps_per_eval_image=500, steps_per_eval_batch=0,
-    steps_per_save=2000, steps_per_eval_all_images=2500,
-    max_num_iterations=30001, mixed_precision=False,
+    steps_per_eval_image=500,
+    steps_per_eval_batch=100,
+    steps_per_save=2000,
+    steps_per_eval_all_images=2500,
+    max_num_iterations=30001,
+    mixed_precision=False,
     pipeline=SplatADPipelineConfig(
         calc_fid_steps=(30000,),
         datamanager=FullImageLidarDatamanagerConfig(
             dataparser=PandaSetDataParserConfig(add_missing_points=True),
             cache_images_type="uint8",
         ),
-        model=SplatADModelConfig(max_steps=30001),
+        model=CoSplatModelConfig(
+            max_steps=30001,
+            fog_beta_init=0.04,   # β=0.01 optimal (3× bias)
+            fog_beta_min=0.03,    # β=0.01 optimal (3× bias)
+        ),
     ),
     optimizers={
         "means": {
             "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
             "scheduler": ExponentialDecaySchedulerConfig(lr_final=1.6e-6, max_steps=30000),
         },
-        "features_dc": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
-            "scheduler": None,
-        },
-        "features_rest": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
-            "scheduler": None,
-        },
-        "opacities": {
-            "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
-            "scheduler": None,
-        },
-        "scales": {
-            "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
-            "scheduler": None,
-        },
+        "features_dc": {"optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15), "scheduler": None},
+        "features_rest": {"optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15), "scheduler": None},
+        "opacities": {"optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15), "scheduler": None},
+        "scales": {"optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15), "scheduler": None},
         "quats": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
         "camera_opt": {
             "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
@@ -468,7 +425,7 @@ method_configs["cosplat"] = TrainerConfig(
 
 method_configs["neurad"] = TrainerConfig(
     method_name="neurad",
-    steps_per_eval_batch=500,
+    steps_per_eval_batch=100,
     steps_per_eval_all_images=5000,
     steps_per_save=2000,
     max_num_iterations=20001,
@@ -513,14 +470,9 @@ method_configs["neurad-scaleopt"] = deepcopy(method_configs["neurad"])
 method_configs["neurad-scaleopt"].method_name = "neurad-scaleopt"
 method_configs["neurad-scaleopt"].pipeline.model.camera_optimizer = ScaledCameraOptimizerConfig(
     weights=(1.0, 1.0, 0.01, 0.01, 0.01, 1.0),  # xrot, yrot, zrot, xtrans, ytrans, ztrans
-    trans_l2_penalty=(
-        1e-2,
-        1e-2,
-        1e-3,
-    ),  # x, y, z
+    trans_l2_penalty=(1e-2, 1e-2, 1e-3),
     mode="SO3xR3",
 )
-
 
 def _scaled_neurad_training(config: TrainerConfig, scale: float, newname: str) -> TrainerConfig:
     config = deepcopy(config)
@@ -537,7 +489,6 @@ def _scaled_neurad_training(config: TrainerConfig, scale: float, newname: str) -
         optimizer["scheduler"].warmup_steps = int(optimizer["scheduler"].warmup_steps * scale)
     return config
 
-
 # Bigger, better, longer, stronger
 method_configs["neurader"] = _scaled_neurad_training(method_configs["neurad"], 2.5, "neurader")
 for optimizer in method_configs["neurader"].optimizers.values():
@@ -553,20 +504,14 @@ for field in (model.field, model.sampling.proposal_field_1, model.sampling.propo
 method_configs["neurader-scaleopt"] = deepcopy(method_configs["neurader"])
 method_configs["neurader-scaleopt"].method_name = "neurader-scaleopt"
 method_configs["neurader-scaleopt"].pipeline.model.camera_optimizer = ScaledCameraOptimizerConfig(
-    weights=(1.0, 1.0, 0.01, 0.01, 0.01, 1.0),  # xrot, yrot, -zrot-, -xtrans-, -ytrans-, ztrans
-    trans_l2_penalty=(
-        1e-2,
-        1e-2,
-        1e-3,
-    ),  # x, y, z
+    weights=(1.0, 1.0, 0.01, 0.01, 0.01, 1.0),
+    trans_l2_penalty=(1e-2, 1e-2, 1e-3),
     mode="SO3xR3",
 )
 
 # Even longer training
 method_configs["neuradest"] = _scaled_neurad_training(method_configs["neurader"], 3, "neuradest")
-method_configs["neuradest-scaleopt"] = _scaled_neurad_training(
-    method_configs["neurader-scaleopt"], 3, "neuradest-scaleopt"
-)
+method_configs["neuradest-scaleopt"] = _scaled_neurad_training(method_configs["neurader-scaleopt"], 3, "neuradest-scaleopt")
 
 # Configurations matching the paper (disable temporal appearance and actor flip)
 method_configs["neurad-paper"] = deepcopy(method_configs["neurad"])
@@ -580,17 +525,8 @@ method_configs["neurad-2x-paper"].pipeline.model.use_temporal_appearance = False
 for f in method_configs["neurad-2x-paper"].pipeline.model.fields:  # type: ignore
     f.flip_prob = 0.0
 
-
 def merge_methods(methods, method_descriptions, new_methods, new_descriptions, overwrite=True):
-    """Merge new methods and descriptions into existing methods and descriptions.
-    Args:
-        methods: Existing methods.
-        method_descriptions: Existing descriptions.
-        new_methods: New methods to merge in.
-        new_descriptions: New descriptions to merge in.
-    Returns:
-        Merged methods and descriptions.
-    """
+    """Merge new methods and descriptions into existing methods and descriptions."""
     methods = OrderedDict(**methods)
     method_descriptions = OrderedDict(**method_descriptions)
     for k, v in new_methods.items():
@@ -599,13 +535,11 @@ def merge_methods(methods, method_descriptions, new_methods, new_descriptions, o
             method_descriptions[k] = new_descriptions.get(k, "")
     return methods, method_descriptions
 
-
 def sort_methods(methods, method_descriptions):
     """Sort methods and descriptions by method name."""
     methods = OrderedDict(sorted(methods.items(), key=lambda x: x[0]))
     method_descriptions = OrderedDict(sorted(method_descriptions.items(), key=lambda x: x[0]))
     return methods, method_descriptions
-
 
 all_methods, all_descriptions = method_configs, descriptions
 # Add discovered external methods
@@ -617,11 +551,8 @@ all_methods, all_descriptions = merge_methods(
     all_methods, all_descriptions, *sort_methods(*get_external_methods()), overwrite=False
 )
 
-AnnotatedBaseConfigUnion = tyro.conf.SuppressFixed[  # Don't show unparseable (fixed) arguments in helptext.
+AnnotatedBaseConfigUnion = tyro.conf.SuppressFixed[
     tyro.conf.FlagConversionOff[
         tyro.extras.subcommand_type_from_defaults(defaults=all_methods, descriptions=all_descriptions)
     ]
 ]
-"""Union[] type over config types, annotated with default instances for use with
-tyro.cli(). Allows the user to pick between one of several base configurations, and
-then override values in it."""
