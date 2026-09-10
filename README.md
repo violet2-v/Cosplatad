@@ -26,7 +26,7 @@ This repository is built on [neurad-studio](https://github.com/georghess/neurad-
 
 **CoSplat** extends SplatAD with zero‑shot dehazing for foggy autonomous driving scenes. It introduces a per‑Gaussian atmospheric scattering model (ASM) that decomposes foggy scenes into a clean surface stream and a volumetric environment stream, enabling dehazed rendering at inference without any clean‑image supervision. Two independent architecture flags support systematic ablation studies — see [CoSplat](#cosplat) below.
 
-CoSplat is registered as a standalone method (`ns-train cosplat ...`) that reuses the `splatad` model implementation via a method-level alias. All CoSplat functionality lives in [`nerfstudio/models/splatad.py`](nerfstudio/models/splatad.py), controlled by `SplatADModelConfig` flags.
+CoSplat is a standalone method (`ns-train cosplat ...`) implemented in [`nerfstudio/models/cosplat.py`](nerfstudio/models/cosplat.py). The vanilla `splatad` baseline remains untouched for fair comparison.
 
 <div align="center">
 <a href="https://zenseact.com/"><picture style="padding-left:10px;padding-right:10px;"><source media="(prefers-color-scheme:dark)" srcset="docs/_static/imgs/ZEN_Vertical_logo_white.svg"/><img alt="zenseact" src="docs/_static/imgs/ZEN_Vertical_logo_black.svg" height="100px"/></picture></a>
@@ -72,7 +72,7 @@ pip install ninja git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindi
 ### Install neurad-studio
 
 ```bash
-git clone https://github.com/你的用户名/neurad-studio.git
+git clone https://github.com/<your-username>/neurad-studio.git
 cd neurad-studio
 pip install -e .
 ```
@@ -104,6 +104,8 @@ python scripts/add_fog_nuscenes.py \
 ### Training commands
 
 CoSplat is registered as a standalone method that inherits the full `splatad` pipeline and optimizer configuration.
+
+> Note: models trained with the previous `splatad` method name (with CoSplat code) remain fully usable — checkpoint configs are self-contained and evaluate with the same scripts.
 
 ```bash
 # Train vanilla SplatAD (no fog)
@@ -157,7 +159,7 @@ Dedicated evaluation scripts compare the dehazed output against clean ground‑t
 
 ```bash
 # PandaSet
-python eval_dehaze_pandaset.py \
+python eval_dehaze_full.py \
     --load-config outputs/cosplat/EXP_NAME/config.yml \
     --clean-gt-dir data/pandaset/001 \
     --output-dir ./eval_results/ --max-vis 10
@@ -229,7 +231,7 @@ CoSplat consistently improves PSNR by ≈5 dB across both datasets and fog den
 | Model | Type | Description |
 | --- | --- | --- |
 | `splatad` | 3DGS | CVPR 2025 — real‑time camera + lidar rendering |
-| `cosplat` | 3DGS | Zero‑shot dehazing built on splatad; `ns-train cosplat ...` |
+| `cosplat` | 3DGS | Zero‑shot dehazing in `cosplat.py`; β=0.01 defaults, override for other fog densities |
 | `neurad` | NeRF | CVPR 2024 highlight — SOTA NeRF for AD scenes |
 | `unisim` | NeRF | Unofficial UniSim implementation (see plugin repo) |
 
