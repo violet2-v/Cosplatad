@@ -15,16 +15,7 @@
 # limitations under the License.
 
 """
-Per-Gaussian Atmospheric Scattering Model + LiDAR Residual Offsets.
-
-Two main ideas:
-  1. Per-Gaussian transmission -> t_map for ASM fog composition.
-     Surface rasterize -> CNN decoder gives clean RGB; per-Gaussian
-     t_i = exp(-beta * d_i) with d_i detached; second raster builds
-     t_map; foggy = clean * t_map + A * (1 - t_map).
-     Skip ASM at eval for zero-shot dehazing.
-  2. LiDAR residual offsets: LiDAR renders use mu + delta_mu,
-     camera uses mu (shared backbone).
+NeRF implementation that combines many recent advancements.
 """
 
 from __future__ import annotations
@@ -36,7 +27,6 @@ from typing import Dict, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from pytorch_msssim import SSIM
 from torch.nn import BCEWithLogitsLoss, Parameter
 from typing_extensions import Literal
@@ -49,21 +39,16 @@ from nerfstudio.cameras.camera_optimizers import (
 )
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.cameras.lidars import Lidars, transform_points, transform_points_pairwise
-from nerfstudio.data.datamanagers.full_images_lidar_datamanager import (
-    AZIM_CHANNELS_PER_TILE,
-    ELEV_CHANNELS_PER_TILE,
-)
+from nerfstudio.data.datamanagers.full_images_lidar_datamanager import AZIM_CHANNELS_PER_TILE, ELEV_CHANNELS_PER_TILE
 from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.data.utils.data_utils import points_in_box
-from nerfstudio.engine.callbacks import (
-    TrainingCallback,
-    TrainingCallbackAttributes,
-    TrainingCallbackLocation,
-)
+from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.field_components.mlp import MLP
 from nerfstudio.model_components.cnns import BasicBlock
 from nerfstudio.model_components.losses import L1Loss, MSELoss
+
+# need following import for background color override
 from nerfstudio.model_components.strategy import ADDefaultStrategy, ADMCMCStrategy
 from nerfstudio.models.ad_model import ADModel, ADModelConfig
 from nerfstudio.models.splatfacto import get_viewmat, resize_image
@@ -79,7 +64,12 @@ except ImportError:
 
 
 def random_quat_tensor(N):
-    u, v, w = torch.rand(N), torch.rand(N), torch.rand(N)
+    """
+    Defines a random quaternion tensor of shape (N, 4)
+    """
+    u = torch.rand(N)
+    v = torch.rand(N)
+    w = torch.rand(N)
     return torch.stack(
         [
             torch.sqrt(1 - u) * torch.sin(2 * math.pi * v),
@@ -91,20 +81,38 @@ def random_quat_tensor(N):
     )
 
 
-def get_ray_dirs_pinhole(cameras, width, height, c2w):
-    ys = (
-        torch.arange(height, device=cameras.device, dtype=torch.float32)
-        + (0.5 - cameras.cy[0, 0])
-    ) / cameras.fy[0, 0]
-    xs = (
-        torch.arange(width, device=cameras.device, dtype=torch.float32)
-        + (0.5 - cameras.cx[0, 0])
-    ) / cameras.fx[0, 0]
-    grid = torch.meshgrid(ys, xs, indexing="ij")
-    dirs = torch.stack([grid[1], -grid[0], -torch.ones_like(grid[0])], dim=-1)
-    dirs = dirs.view(-1, 3)
-    dirs = torch.matmul(dirs, c2w[0, :3, :3].transpose(0, 1))
-    return (dirs / dirs.norm(dim=-1, keepdim=True)).view(height, width, 3)
+def RGB2SH(rgb):
+    """
+    Converts from RGB values [0,1] to the 0th spherical harmonic coefficient
+    """
+    C0 = 0.28209479177387814
+    return (rgb - 0.5) / C0
+
+
+def SH2RGB(sh):
+    """
+    Converts from the 0th spherical harmonic coefficient to RGB values [0,1]
+    """
+    C0 = 0.28209479177387814
+    return sh * C0 + 0.5
+
+
+def get_ray_dirs_pinhole(cameras: Cameras, width: int, height: int, c2w: torch.Tensor):
+    ys = (torch.arange(height, device=cameras.device, dtype=torch.float32) + (0.5 - cameras.cy[0, 0])) / cameras.fy[
+        0, 0
+    ]
+    xs = (torch.arange(width, device=cameras.device, dtype=torch.float32) + (0.5 - cameras.cx[0, 0])) / cameras.fx[0, 0]
+    image_coords = torch.meshgrid(ys, xs, indexing="ij")
+    # flip y and z to align with nerfstudio convention
+    directions = torch.stack(
+        [image_coords[1], -image_coords[0], -torch.ones_like(image_coords[0])], dim=-1
+    )  # (h, w, 3)
+    directions = directions.view(-1, 3)
+    directions = torch.matmul(directions, c2w[0, :3, :3].transpose(0, 1))
+    directions = directions / directions.norm(dim=-1, keepdim=True)
+    directions = directions.view(height, width, 3)
+
+    return directions
 
 
 class RGBDecoderCNN(torch.nn.Module):
@@ -119,138 +127,152 @@ class RGBDecoderCNN(torch.nn.Module):
         num_hidden_blocks=1,
     ):
         super().__init__()
-        last = torch.nn.Conv2d(hidden_dim, out_dim, 1)
-        last.weight.data *= weight_init_scale
-
-        layers = [
-            BasicBlock(
-                in_dim, hidden_dim, kernel_size,
-                padding=kernel_size // 2, use_bn=False,
-            )
-        ]
+        last_layer = torch.nn.Conv2d(hidden_dim, out_dim, 1)
+        last_layer.weight.data *= weight_init_scale
+        layers = [BasicBlock(in_dim, hidden_dim, kernel_size, padding=kernel_size // 2, use_bn=False)]
         for _ in range(num_hidden_blocks):
-            layers.append(
-                BasicBlock(
-                    hidden_dim, hidden_dim, kernel_size,
-                    padding=kernel_size // 2, use_bn=False,
-                )
-            )
-        layers.append(last)
+            layers.append(BasicBlock(hidden_dim, hidden_dim, kernel_size, padding=kernel_size // 2, use_bn=False))
+        layers.append(last_layer)
         self.net = torch.nn.Sequential(*layers)
         self.skip_dim = skip_dim
         self.out_dim = out_dim
 
     def forward(self, features, ray_dirs):
         features = features.view(1, *features.shape[-3:])
-        albedo, spec = features.split(
-            [self.skip_dim, features.shape[-1] - self.skip_dim], dim=-1
-        )
-        spec = torch.cat([spec, ray_dirs], dim=-1).permute(0, 3, 1, 2)
-        spec = self.net(spec).permute(0, 2, 3, 1)
+        albedo, spec = features.split([self.skip_dim, features.shape[-1] - self.skip_dim], dim=-1)
+
+        spec = torch.cat([spec, ray_dirs], dim=-1)
+        spec = spec.permute(0, 3, 1, 2)
+        spec = self.net(spec)
+
+        spec = spec.permute(0, 2, 3, 1)
+
         return albedo * (1 + spec[..., :3]) + spec[..., 3:]
 
 
 @dataclass
 class SplatADModelConfig(ADModelConfig):
-    _target: Type = field(default_factory=lambda: SplatADModel)
+    """Splatfacto Model Config, nerfstudio's implementation of Gaussian Splatting"""
 
-    # ---- original splat-ad ----
+    _target: Type = field(default_factory=lambda: SplatADModel)
     warmup_length: int = 500
+    """period of steps where refinement is turned off"""
     refine_every: int = 100
+    """period of steps where gaussians are culled and densified"""
     resolution_schedule: int = 3000
+    """training starts at 1/d resolution, every n steps this is doubled"""
     background_color: Literal["random", "black", "white"] = "random"
+    """Whether to randomize the background color."""
     num_downscales: int = 2
+    """at the beginning, resolution is 1/2^d, where d is this number"""
     strategy: Literal["default", "mcmc"] = "mcmc"
+    """Strategy to use for the optimization"""
     cull_alpha_thresh: float = 0.1
+    """threshold of opacity for culling gaussians. One can set it to a lower value (e.g. 0.005) for higher quality."""
     cull_scale_thresh: float = 500.0
+    """threshold of scale for culling huge gaussians"""
     continue_cull_post_densification: bool = True
+    """If True, continue to cull gaussians post refinement"""
     reset_alpha_every: int = 30
+    """Every this many refinement steps, reset the alpha"""
     densify_grad_thresh: float = 0.0006
+    """threshold of positional gradient norm for densifying gaussians"""
     densify_size_thresh: float = 0.5
+    """below this size, gaussians are *duplicated*, otherwise split"""
     n_split_samples: int = 2
+    """number of samples to split gaussians into"""
     cull_screen_size: float = 0.15
+    """if a gaussian is more than this percent of screen space, cull it"""
     split_screen_size: float = 0.05
+    """if a gaussian is more than this percent of screen space, split it"""
     stop_screen_size_at: int = 4000
+    """stop culling/splitting at this step WRT screen size of gaussians"""
     use_absgrad: bool = True
+    """If True, use absolute gradient for densification"""
     mcmc_cap_max: int = 5_000_000
+    """Maximum number of GSs. Default to 1_000_000."""
     mcmc_noise_lr: float = 5e5
+    """MCMC samping noise learning rate. Default to 5e5."""
     mcmc_min_opacity: float = 0.005
+    """GSs with opacity below this value will be pruned. Default to 0.005."""
     verbose: bool = True
+    """Whether to print verbose information. Default to False."""
     max_steps: int = 30_000
+    """Number of training steps"""
     init_opacities: float = 0.1
+    """Initial opacity of the gaussians"""
     init_scale: float = 1.0
+    """Initial scale of the gaussians"""
     max_num_seed_points: int = 2_000_000
-    ssim_lambda: float = 0.30
+    """Maximum number of seed points to use for initialization. -1 means all seed points are used."""
+    ssim_lambda: float = 0.2
+    """weight of ssim loss"""
     stop_split_at: int = 15000
+    """stop splitting at this step"""
     mcmc_scale_reg_lambda: float = 0.001
+    """weight of scale regularization loss"""
     mcmc_opacity_reg_lambda: float = 0.005
+    """weight of opacity regularization loss"""
     output_depth_during_training: bool = False
+    """If True, output depth during training. Otherwise, only output depth during evaluation."""
     rasterize_mode: Literal["classic", "antialiased"] = "antialiased"
-    camera_optimizer: CameraOptimizerConfig = field(
-        default_factory=lambda: CameraOptimizerConfig(mode="off")
-    )
+    """
+    Classic mode of rendering will use the EWA volume splatting with a [0.3, 0.3] screen space blurring kernel. This
+    approach is however not suitable to render tiny gaussians at higher or lower resolution than the captured, which
+    results "aliasing-like" artifacts. The antialiased mode overcomes this limitation by calculating compensation factors
+    and apply them to the opacities of gaussians to preserve the total integrated density of splats.
+
+    However, PLY exported with antialiased rasterize mode is not compatible with classic mode. Thus many web viewers that
+    were implemented for classic mode can not render antialiased mode PLY properly without modifications.
+    """
+    camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="off"))
+    """Config of the camera optimizer to use"""
     camera_velocity_optimizer: CameraVelocityOptimizerConfig = field(
         default_factory=lambda: CameraVelocityOptimizerConfig(enabled=True)
     )
+    """Config of the camera velocity optimizer to use"""
     feature_dim: int = 13
+    """Dimension of the feature vector"""
     appearance_dim: int = 8
+    """Dimension of the appearance vector"""
     implementation: Literal["tcnn", "torch"] = "tcnn"
+    """Which implementation to use for the model."""
     actor_flip_probability: float = 0.5
+    """Probability of flipping the actor gaussians around the y-axis"""
     flip_actors_at_init: bool = True
+    """If True, duplicate the actor gaussians around the y-axis at initialization"""
     n_far_points: float = 300_000
+    """Fraction of the seed points to add as extra points on the faces of the scene box."""
     depth_lambda: float = 0.1
+    """Weight of the depth loss"""
     depth_loss_quantile_threshold: float = 0.95
+    """Quantile threshold for the depth loss"""
     intensity_lambda: float = 1.0
+    """Weight of the intensity loss"""
     ray_drop_lambda: float = 0.1
+    """Weight of the ray drop loss"""
     compensate_rs_camera: bool = True
+    """If True, compensate the camera for the RS camera"""
     compensate_rs_lidar: bool = True
+    """If True, compensate the lidar for the RS camera"""
     radius_clip_pix: float = 0.0
+    """Clip radius in pixels, 0.0 means no clipping"""
     radius_clip_lidar: float = 0.0
+    """Clip radius in degrees, 0.0 means no clipping"""
     line_of_sight_lambda: float = 0.1
+    """Weight of the line of sight loss"""
     line_of_sight_dist: float = 0.8
+    """"""
     use_camopt_in_eval: bool = False
+    """Use result of camera optimization also during evaluation. Only makes sense if trained with train_eval_split=1.0."""
     min_points_per_actor: int = 500
+    """Minimum number of points per actor"""
     rgb_decoder_hidden_dim: int = 32
+    """Hidden dimension of the RGB decoder"""
     rgb_decoder_kernel_size: int = 3
+    """Kernel size of the RGB decoder"""
     rgb_decoder_num_hidden_blocks: int = 1
-
-    # ---- Innovation 1: per-Gaussian t -> t_map ASM ----
-    use_dual_stream: bool = True
-    """Master switch for the dual-stream architecture."""
-
-    fog_beta_init: float = 0.03
-    """Initial fog density beta (before softplus + beta_min)."""
-
-    fog_beta_min: float = 0.02
-    """Hard lower bound — only prevents collapse to zero."""
-
-    fog_beta_reg: float = 0.005
-    """L2 regularisation on beta — minimal, recon loss drives beta."""
-
-    fog_t_min: float = 0.20
-    """Minimum per-Gaussian transmission."""
-
-    fog_atmospheric_light_reg: float = 0.05
-    """L2 weight pulling atmospheric light A toward target grey-white."""
-
-    fog_atmospheric_light_target: Tuple[float, float, float] = (0.95, 0.95, 0.95)
-    """Target RGB for A regularisation — matches synthetic fog generator."""
-
-    render_weather: bool = True
-    """If True, apply ASM during eval. Set False for zero-shot dehazing."""
-
-    t_map_reg_lambda: float = 0.05
-    """Weak L1 supervision of t_map from depth-derived transmission (alpha>0.7)."""
-
-    depth_weighted_loss_lambda: float = 0.30
-    """Weight for sqrt depth-weighted reconstruction loss."""
-
-    # ---- Innovation 2: LiDAR residual offsets ----
-    use_lidar_offset: bool = True
-    """Learn per-Gaussian LiDAR position offsets."""
-
-    lidar_offset_reg: float = 0.01
-    """L2 regularisation keeping offsets small."""
+    """Number of hidden blocks of the RGB decoder"""
 
     def __post_init__(self):
         if self.strategy == "mcmc":
@@ -259,6 +281,12 @@ class SplatADModelConfig(ADModelConfig):
 
 
 class SplatADModel(ADModel):
+    """Neurad-studio's implementation of Gaussian Splatting
+
+    Args:
+        config: SplatAD configuration to instantiate model
+    """
+
     config: SplatADModelConfig
 
     def __init__(
@@ -271,127 +299,103 @@ class SplatADModel(ADModel):
         self.last_size = (1, 1)
         super().__init__(*args, **kwargs)
 
-    @property
-    def has_environment_stream(self):
-        return self.config.use_dual_stream and self.raw_fog_beta is not None
-
-    # ------------------------------------------------------------------
-    # populate
-    # ------------------------------------------------------------------
     def populate_modules(self):
         super().populate_modules()
         self.collider = None
 
-        sp, dp = self.split_seed_points(self.seed_points)
-        sw = self.scene_box.aabb.diff(dim=0)[..., 0].item()
-        sl = self.scene_box.aabb.diff(dim=0)[..., 1].item()
+        static_points, dynamic_points = self.split_seed_points(self.seed_points)
+        (
+            scene_width,
+            scene_length,
+        ) = (
+            self.scene_box.aabb.diff(dim=0)[..., 0].item(),
+            self.scene_box.aabb.diff(dim=0)[..., 1].item(),
+        )
+        random_directions = torch.rand(int(self.config.n_far_points), 3) - 0.5
+        random_directions[:, -1] = torch.abs(random_directions[:, -1])
+        random_directions = random_directions / random_directions.norm(dim=-1, keepdim=True)
+        random_distances = torch.rand(int(self.config.n_far_points), 1)
+        near = min(scene_width, scene_length) / 2
+        far = 1e4
+        random_distances = 1 / (1 / near * (1 - random_distances) + 1 / far * random_distances)
+        far_points = random_directions * random_distances
+        far_points = torch.cat([far_points, torch.randint_like(far_points, low=0, high=255)], dim=-1)
 
-        # Far / close random points to fill empty space
-        rand_d = torch.rand(int(self.config.n_far_points), 3) - 0.5
-        rand_d[:, -1] = rand_d[:, -1].abs()
-        rand_d = rand_d / rand_d.norm(dim=-1, keepdim=True)
-        rand_dist = torch.rand(int(self.config.n_far_points), 1)
-        n, f = min(sw, sl) / 2, 1e4
-        rand_dist = 1 / (1 / n * (1 - rand_dist) + 1 / f * rand_dist)
-        far_pts = rand_d * rand_dist
-        far_pts = torch.cat([far_pts, torch.randint_like(far_pts, 0, 255)], -1)
+        # randomly sample points within the scene box
+        close_points = torch.rand(int(self.config.n_far_points), 3) - 0.5
+        close_points = close_points * torch.tensor([scene_width, scene_length, 50])
+        close_points = torch.cat([close_points, torch.randint_like(close_points, low=0, high=255)], dim=-1)
 
-        close_pts = torch.rand(int(self.config.n_far_points), 3) - 0.5
-        close_pts = close_pts * torch.tensor([sw, sl, 50])
-        close_pts = torch.cat([close_pts, torch.randint_like(close_pts, 0, 255)], -1)
+        static_points = torch.cat([static_points, far_points, close_points], dim=0)
 
-        sp = torch.cat([sp, far_pts, close_pts], 0)
         self.gauss_params = self.create_gauss_param_dict(
-            dp, [sp], self.config.flip_actors_at_init
+            dynamic_points,
+            [static_points],
+            flip_actors_at_init=self.config.flip_actors_at_init,
         )
 
-        # Innovation 2: per-Gaussian LiDAR offsets
-        if self.config.use_lidar_offset:
-            self.gauss_params["lidar_offsets"] = torch.nn.Parameter(
-                torch.zeros(self.gauss_params["means"].shape[0], 3)
-            )
-
-        # Innovation 1: learnable ASM parameters
-        if self.config.use_dual_stream:
-            ba = max(self.config.fog_beta_init - self.config.fog_beta_min, 1e-6)
-            self.raw_fog_beta = torch.nn.Parameter(
-                torch.tensor(math.log(math.exp(ba) - 1.0))
-            )
-            target = self.config.fog_atmospheric_light_target
-            self.fog_atmospheric_light = torch.nn.Parameter(
-                torch.logit(torch.tensor(target, dtype=torch.float32))
-            )
-        else:
-            self.raw_fog_beta = None
-            self.fog_atmospheric_light = None
-
-        ds = self.kwargs["metadata"]
-        ns = len(ds["sensor_idx_to_name"])
-
-        self.camera_optimizer = self.config.camera_optimizer.setup(
+        dataset_metadata = self.kwargs["metadata"]
+        num_sensors = len(dataset_metadata["sensor_idx_to_name"])
+        self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"
         )
-        self.camera_velocity_optimizer = self.config.camera_velocity_optimizer.setup(
+        self.camera_velocity_optimizer: CameraVelocityOptimizer = self.config.camera_velocity_optimizer.setup(
             num_cameras=self.num_train_data,
-            num_unique_cameras=ns,
+            num_unique_cameras=num_sensors,
             device="cpu",
         )
 
-        vd = 3
+        viewdir_dim = 3
         self.rgb_decoder = torch.compile(
             RGBDecoderCNN(
-                self.config.feature_dim + self.config.appearance_dim + vd,
+                self.config.feature_dim + self.config.appearance_dim + viewdir_dim,
                 hidden_dim=self.config.rgb_decoder_hidden_dim,
                 kernel_size=self.config.rgb_decoder_kernel_size,
                 num_hidden_blocks=self.config.rgb_decoder_num_hidden_blocks,
             ),
-            disable=True,
+            disable=True,  # TODO: enable automatically if we don't use the viewer
         )
-        self.appearance_embedding = torch.nn.Embedding(ns, self.config.appearance_dim)
-        self.fallback_sensor_idx = ViewerSlider("fallback sensor idx", 0, 0, ns - 1, step=1)
+
+        self.appearance_embedding = torch.nn.Embedding(num_sensors, self.config.appearance_dim)
+        self.fallback_sensor_idx = ViewerSlider("fallback sensor idx", 0, 0, num_sensors - 1, step=1)
 
         self.setup_rs_editing()
 
         self.lidar_decoder = MLP(
-            in_dim=self.config.feature_dim + self.config.appearance_dim + vd,
+            in_dim=self.config.feature_dim
+            + self.config.appearance_dim
+            + viewdir_dim,  # feature + appearance + view direction
             layer_width=32,
-            out_dim=2,
+            out_dim=2,  # (intensity, ray_drop)
             num_layers=3,
             implementation=self.config.implementation,
             out_activation=None,
         )
 
-        self.render_weather_slider = ViewerSlider(
-            "Render Weather",
-            1.0,
-            0.0,
-            1.0,
-            step=1.0,
-            cb_hook=lambda o: setattr(self.config, "render_weather", o.value > 0.5),
-        )
-
+        # metrics
         from torchmetrics.image import PeakSignalNoiseRatio
         from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
         self.ssim = SSIM(data_range=1.0, size_average=True, channel=3)
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
-
         self.step = 0
-        self.median_l2 = lambda p, g: torch.median((p - g) ** 2)
-        self.mean_rel_l2 = lambda p, g: torch.mean(((p - g) / g) ** 2)
-        self.rmse = lambda p, g: torch.sqrt(torch.mean((p - g) ** 2))
-        self.chamfer_distance = lambda p, g: chamfer_distance(p, g, 1000, True)
+        self.median_l2 = lambda pred, gt: torch.median((pred - gt) ** 2)
+        self.mean_rel_l2 = lambda pred, gt: torch.mean(((pred - gt) / gt) ** 2)
+        self.rmse = lambda pred, gt: torch.sqrt(torch.mean((pred - gt) ** 2))
+        self.chamfer_distance = lambda pred, gt: chamfer_distance(pred, gt, 1_000, True)
 
+        # losses
         self.depth_loss = L1Loss(reduction="none")
         self.intensity_loss = MSELoss()
         self.ray_drop_loss = BCEWithLogitsLoss()
 
-        self.background_color = (
-            torch.tensor([0.1490, 0.1647, 0.2157])
-            if self.config.background_color == "random"
-            else get_color(self.config.background_color)
-        )
+        if self.config.background_color == "random":
+            self.background_color = torch.tensor(
+                [0.1490, 0.1647, 0.2157]
+            )  # This color is the same as the default background color in Viser. This would only affect the background color when rendering.
+        else:
+            self.background_color = get_color(self.config.background_color)
 
         if self.config.strategy == "mcmc":
             self.strategy = ADMCMCStrategy(
@@ -425,13 +429,8 @@ class SplatADModel(ADModel):
             )
             self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"Strategy {self.config.strategy} is not implemented.")
 
-        self.optimizers = {}
-
-    # ------------------------------------------------------------------
-    # properties
-    # ------------------------------------------------------------------
     @property
     def num_points(self):
         return self.means.shape[0]
@@ -465,6 +464,7 @@ class SplatADModel(ADModel):
         return self.gauss_params["id"]
 
     def setup_rs_editing(self):
+        # RS sliders
         self.rs_editing = {
             "rs_time": 0.0,
             "lin_vel_x": 0.0,
@@ -475,156 +475,259 @@ class SplatADModel(ADModel):
             "ang_vel_z": 0.0,
         }
         self.rs_time_slider = ViewerSlider(
-            "rs time", 0.0, 0.0, 0.2, 0.001,
-            cb_hook=lambda o: self.rs_editing.update({"rs_time": o.value}),
+            name="rs time",
+            default_value=self.rs_editing["rs_time"],
+            min_value=0.0,
+            max_value=0.2,
+            step=0.001,
+            cb_hook=lambda obj: self.rs_editing.update({"rs_time": obj.value}),
         )
         self.rs_lin_vel_x_slider = ViewerSlider(
-            "rs lin vel x", 0.0, -30, 30, 0.01,
-            cb_hook=lambda o: self.rs_editing.update({"lin_vel_x": o.value}),
+            name="rs lin vel x",
+            default_value=self.rs_editing["lin_vel_x"],
+            min_value=-30.0,
+            max_value=30.0,
+            step=0.01,
+            cb_hook=lambda obj: self.rs_editing.update({"lin_vel_x": obj.value}),
         )
         self.rs_lin_vel_y_slider = ViewerSlider(
-            "rs lin vel y", 0.0, -30, 30, 0.01,
-            cb_hook=lambda o: self.rs_editing.update({"lin_vel_y": o.value}),
+            name="rs lin vel y",
+            default_value=self.rs_editing["lin_vel_y"],
+            min_value=-30.0,
+            max_value=30.0,
+            step=0.01,
+            cb_hook=lambda obj: self.rs_editing.update({"lin_vel_y": obj.value}),
         )
         self.rs_lin_vel_z_slider = ViewerSlider(
-            "rs lin vel z", 0.0, -30, 30, 0.01,
-            cb_hook=lambda o: self.rs_editing.update({"lin_vel_z": o.value}),
+            name="rs lin vel z",
+            default_value=self.rs_editing["lin_vel_z"],
+            min_value=-30.0,
+            max_value=30.0,
+            step=0.01,
+            cb_hook=lambda obj: self.rs_editing.update({"lin_vel_z": obj.value}),
         )
         self.rs_ang_vel_x_slider = ViewerSlider(
-            "rs ang vel x", 0.0, -1, 1, 0.01,
-            cb_hook=lambda o: self.rs_editing.update({"ang_vel_x": o.value}),
+            name="rs ang vel x",
+            default_value=self.rs_editing["ang_vel_x"],
+            min_value=-1.0,
+            max_value=1.0,
+            step=0.01,
+            cb_hook=lambda obj: self.rs_editing.update({"ang_vel_x": obj.value}),
         )
         self.rs_ang_vel_y_slider = ViewerSlider(
-            "rs ang vel y", 0.0, -1, 1, 0.01,
-            cb_hook=lambda o: self.rs_editing.update({"ang_vel_y": o.value}),
+            name="rs ang vel y",
+            default_value=self.rs_editing["ang_vel_y"],
+            min_value=-1.0,
+            max_value=1.0,
+            step=0.01,
+            cb_hook=lambda obj: self.rs_editing.update({"ang_vel_y": obj.value}),
         )
         self.rs_ang_vel_z_slider = ViewerSlider(
-            "rs ang vel z", 0.0, -1, 1, 0.01,
-            cb_hook=lambda o: self.rs_editing.update({"ang_vel_z": o.value}),
+            name="rs ang vel z",
+            default_value=self.rs_editing["ang_vel_z"],
+            min_value=-1.0,
+            max_value=1.0,
+            step=0.01,
+            cb_hook=lambda obj: self.rs_editing.update({"ang_vel_z": obj.value}),
         )
 
-    def load_state_dict(self, d, **kwargs):
+    def load_state_dict(self, dict, **kwargs):  # type: ignore
+        # resize the parameters to match the new number of points
         self.step = 30000
-        newp = d["gauss_params.means"].shape[0]
-        for n, p in self.gauss_params.items():
-            self.gauss_params[n] = torch.nn.Parameter(
-                torch.zeros(newp, *p.shape[1:], device=self.device)
-            )
-        if self.config.use_lidar_offset and "gauss_params.lidar_offsets" not in d:
-            d["gauss_params.lidar_offsets"] = torch.zeros(newp, 3)
-        if self.raw_fog_beta is not None and "raw_fog_beta" not in d:
-            d["raw_fog_beta"] = self.raw_fog_beta.data
-        if self.fog_atmospheric_light is not None and "fog_atmospheric_light" not in d:
-            d["fog_atmospheric_light"] = self.fog_atmospheric_light.data
-        super().load_state_dict(d, **kwargs)
+        newp = dict["gauss_params.means"].shape[0]
+        for name, param in self.gauss_params.items():
+            old_shape = param.shape
+            new_shape = (newp,) + old_shape[1:]
+            self.gauss_params[name] = torch.nn.Parameter(torch.zeros(new_shape, device=self.device))
+        super().load_state_dict(dict, **kwargs)
 
-    def create_gauss_param_dict(self, dyn, st, flip_actors=True):
-        pds = []
+    def create_gauss_param_dict(
+        self,
+        dyn_seed_points_list: List[torch.Tensor],
+        static_seed_points_list: List[torch.Tensor],
+        flip_actors_at_init: bool = True,
+    ):
+        """Create a dict of parameters for the gaussians, created from a list with sets of seed points.
+
+        seed_points_list - List of seed points. Each element in the list is a tensor of shape (N, 6).
+
+        Returns:
+            Parameter dict with the learnable parameters of the gaussians.
+        """
+
+        param_dicts = []
         self.xys_grad_norm = None
         self.max_2Dsize = None
-        for i, sp in enumerate(dyn + st):
-            flip = flip_actors and i < len(dyn)
-            m = torch.nn.Parameter(sp[:, :3])
-            n = m.shape[0]
-            if n < 4:
-                warnings.warn(f"Actor {i}<4")
-                dist = torch.ones(n, 3)
+        for i, seed_points in enumerate(dyn_seed_points_list + static_seed_points_list):
+            assert seed_points is not None
+            assert seed_points.shape[1] == 6
+            flip = False
+            if flip_actors_at_init and i < len(dyn_seed_points_list):
+                flip = True
+
+            means = torch.nn.Parameter(seed_points[:, :3])
+            num_points = means.shape[0]
+
+            if num_points < 4:
+                warnings.warn(f"Actor {i} has less than 4 points, skipping")
+                distances = torch.ones((num_points, 3))
             else:
-                dist, _ = self.k_nearest_sklearn(m.data, 3)
-                dist = torch.from_numpy(dist)
-            sc = torch.nn.Parameter(
-                torch.log(dist.mean(-1, keepdim=True).repeat(1, 3) * self.config.init_scale)
+                distances, _ = self.k_nearest_sklearn(means.data, 3)
+                distances = torch.from_numpy(distances)
+            # find the average of the three nearest neighbors for each point and use that as the scale
+            avg_dist = distances.mean(dim=-1, keepdim=True)
+            scales = torch.nn.Parameter(torch.log(avg_dist.repeat(1, 3) * self.config.init_scale))
+
+            quats = torch.nn.Parameter(random_quat_tensor(num_points))
+
+            features_dc = torch.nn.Parameter(seed_points[:, 3:] / 255)
+            features_rest = torch.nn.Parameter(
+                torch.randn(
+                    features_dc.shape[0],
+                    max(self.config.feature_dim, 0),
+                    dtype=seed_points.dtype,
+                    device=seed_points.device,
+                )
             )
-            q = torch.nn.Parameter(random_quat_tensor(n))
-            fdc = torch.nn.Parameter(sp[:, 3:] / 255)
-            fr = torch.nn.Parameter(
-                torch.randn(n, max(self.config.feature_dim, 0), dtype=sp.dtype, device=sp.device)
-            )
-            op = torch.nn.Parameter(torch.logit(self.config.init_opacities * torch.ones(n, 1)))
+
+            opacities = torch.nn.Parameter(torch.logit(self.config.init_opacities * torch.ones(num_points, 1)))
             ids = torch.nn.Parameter(
-                torch.full((n, 1), min(float(i), len(dyn))), requires_grad=False
+                torch.full((num_points, 1), min(float(i), len(dyn_seed_points_list))), requires_grad=False
             )
             if flip:
-                mm = m.clone()
-                mm[:, 0] *= -1
-                mq = q.clone()
-                mq[:, 1] *= -1
-                m = torch.nn.Parameter(torch.cat([m, mm], 0))
-                sc = torch.nn.Parameter(torch.cat([sc, sc.clone()], 0))
-                q = torch.nn.Parameter(torch.cat([q, mq], 0))
-                fdc = torch.nn.Parameter(torch.cat([fdc, fdc.clone()], 0))
-                fr = torch.nn.Parameter(torch.cat([fr, fr.clone()], 0))
-                op = torch.nn.Parameter(torch.cat([op, op.clone()], 0))
-                ids = torch.nn.Parameter(torch.cat([ids, ids.clone()], 0))
-            pds.append(
+                # duplicate all points and flip them around the y-axis
+                mirrored_means = means.clone()
+                mirrored_means[:, 0] *= -1
+                mirrored_quats = quats.clone()
+                mirrored_quats[:, 1] *= -1
+                means = torch.nn.Parameter(torch.cat([means, mirrored_means], dim=0))
+                scales = torch.nn.Parameter(torch.cat([scales, scales.clone()], dim=0))
+                quats = torch.nn.Parameter(torch.cat([quats, mirrored_quats], dim=0))
+                features_dc = torch.nn.Parameter(torch.cat([features_dc, features_dc.clone()], dim=0))
+                features_rest = torch.nn.Parameter(torch.cat([features_rest, features_rest.clone()], dim=0))
+                opacities = torch.nn.Parameter(torch.cat([opacities, opacities.clone()], dim=0))
+                ids = torch.nn.Parameter(torch.cat([ids, ids.clone()], dim=0))
+
+            param_dicts.append(
                 {
-                    "means": m,
-                    "scales": sc,
-                    "quats": q,
-                    "features_dc": fdc,
-                    "features_rest": fr,
-                    "opacities": op,
+                    "means": means,
+                    "scales": scales,
+                    "quats": quats,
+                    "features_dc": features_dc,
+                    "features_rest": features_rest,
+                    "opacities": opacities,
                     "id": ids,
                 }
             )
         return torch.nn.ParameterDict(
-            {k: torch.cat([p[k] for p in pds], 0) for k in pds[0]}
+            {
+                key: torch.cat(
+                    [param_dict[key] for param_dict in param_dicts],
+                    dim=0,
+                )
+                for key in param_dicts[0].keys()
+            }
         )
 
     @torch.no_grad()
-    def split_seed_points(self, seed_points):
-        na = self.dynamic_actors.n_actors
-        sp = []
-        dp = [[] for _ in range(na)]
-        for a in range(na):
-            n = self.config.min_points_per_actor
-            rp = (torch.rand(n, 3, device=seed_points[0].device) - 0.5) * self.dynamic_actors.actor_sizes[a]
-            dp[a].append(torch.cat([rp, torch.rand(n, 3, device=seed_points[0].device) * 255], -1))
-        for ct in seed_points[2].unique():
-            p = seed_points[0][seed_points[2] == ct]
-            c = seed_points[1][seed_points[2] == ct]
-            mask = torch.ones(p.shape[0], dtype=torch.bool)
-            b2w, e = self.dynamic_actors.get_boxes2world(ct.unsqueeze(-1), flatten=False)
-            b2w = b2w.squeeze(0)
-            e = e.squeeze(0)
-            for a in range(na):
-                if e[a]:
-                    am = points_in_box(
-                        p, b2w[a],
-                        self.dynamic_actors.actor_sizes[a] + self.dynamic_actors.actor_padding,
+    def split_seed_points(self, seed_points: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
+        """Split the seed points into static and dynamic points using the dynamic actors information.
+
+        seed_points - Tuple of (points, colors, times)
+
+        Returns:
+            Tuple of (static_points, dynamic_points). Points have shape (N, 6) where N is the number of points and the
+            columns are x, y, z, r, g, b. Dynamic points is a list of tensors, one for each actor.
+        """
+        num_actors = self.dynamic_actors.n_actors
+        static_points = []
+        dynamic_points = [[] for _ in range(num_actors)]
+        unique_seed_point_times = seed_points[2].unique()
+        # begin by adding a few random points to all actors
+        for actor_idx in range(num_actors):
+            n_points = self.config.min_points_per_actor
+            random_points = (
+                torch.rand((n_points, 3), device=seed_points[0].device) - 0.5
+            ) * self.dynamic_actors.actor_sizes[actor_idx]
+            random_colors = torch.rand((n_points, 3), device=seed_points[0].device) * 255
+            dynamic_points[actor_idx].append(torch.cat([random_points, random_colors], dim=-1))
+        for current_time in unique_seed_point_times:
+            points = seed_points[0][seed_points[2] == current_time]
+            colors = seed_points[1][seed_points[2] == current_time]
+            static_mask = torch.ones(points.shape[0], dtype=torch.bool)
+            boxes2world, exists_at_time = self.dynamic_actors.get_boxes2world(current_time.unsqueeze(-1), flatten=False)
+            boxes2world = boxes2world.squeeze(0)
+            exists_at_time = exists_at_time.squeeze(0)
+            assert boxes2world.shape[0] == num_actors
+            for actor_idx in range(num_actors):
+                if exists_at_time[actor_idx]:
+                    actor_mask = points_in_box(
+                        points,
+                        boxes2world[actor_idx],
+                        self.dynamic_actors.actor_sizes[actor_idx] + self.dynamic_actors.actor_padding,
                     )
-                    if am.any():
-                        w2b = pose_inverse(b2w[a]).reshape(-1, 3, 4)
-                        pl = transform_points(p[am].reshape(-1, 3), w2b)
-                        mi = pl.clone()
-                        mi[:, 0] *= -1
-                        pl = torch.cat([pl, mi], 0)
-                        ac = torch.cat([c[am], c[am]], 0)
-                        dp[a].append(torch.cat([pl, ac], -1))
-                        mask = mask & ~am
+                    if actor_mask.any():
+                        world2box = pose_inverse(boxes2world[actor_idx]).reshape(-1, 3, 4)
+                        points_in_local_box = transform_points(points[actor_mask].reshape(-1, 3), world2box)
+                        mirrored_points = points_in_local_box.clone()
+                        mirrored_points[:, 0] *= -1
+                        points_in_local_box = torch.cat([points_in_local_box, mirrored_points], dim=0)
+                        actor_colors = torch.cat([colors[actor_mask], colors[actor_mask]], dim=0)
+                        dynamic_points[actor_idx].append(
+                            torch.cat([points_in_local_box, actor_colors], dim=-1)
+                        )  # x, y, z, r, g, b
+
+                        static_mask = static_mask & ~actor_mask
                     else:
-                        dp[a].append(torch.empty(0, 6, device=p.device))
-            sp.append(torch.cat([p[mask], c[mask]], -1))
-        dp = [self.prune_seed_points(torch.cat(x), True) for x in dp]
-        return self.prune_seed_points(torch.cat(sp)), dp
+                        dynamic_points[actor_idx].append(torch.empty((0, 6), device=points.device))
 
-    def prune_seed_points(self, pts, is_dynamic=False):
-        if pts is None or pts.shape[0] == 0:
-            return pts
-        if 0 < self.config.max_num_seed_points < pts.shape[0]:
-            return pts[torch.randperm(pts.shape[0])[: self.config.max_num_seed_points]]
-        return pts
+            static_points.append(torch.cat([points[static_mask], colors[static_mask]], dim=-1))  # x, y, z, r, g, b
 
-    def k_nearest_sklearn(self, x, k):
+        # TODO(carlinds): Currently pruning per actor and static scene. Total number of points will be more than max_num_seed_points.
+        dynamic_points = [self.prune_seed_points(torch.cat(points), is_dynamic=True) for points in dynamic_points]
+        static_points = self.prune_seed_points(torch.cat(static_points))
+        return static_points, dynamic_points
+
+    def prune_seed_points(self, seed_points: torch.Tensor, is_dynamic: bool = False):
+        """Prune the seed points to the maximum number of seed points allowed.
+
+        seed_points - Seed points tensor of shape (N, 6).
+
+        Returns:
+            Pruned seed points tensor.
+        """
+        if seed_points is None or seed_points.shape[0] == 0:
+            return seed_points
+
+        if self.config.max_num_seed_points > 0 and seed_points.shape[0] > self.config.max_num_seed_points:
+            n_seed_points = seed_points.shape[0]
+            perm_idx = torch.randperm(n_seed_points)
+            seed_points = seed_points[perm_idx][: self.config.max_num_seed_points]
+        return seed_points
+
+    def k_nearest_sklearn(self, x: torch.Tensor, k: int):
+        """
+            Find k-nearest neighbors using sklearn's NearestNeighbors.
+        x: The data tensor of shape [num_samples, num_features]
+        k: The number of neighbors to retrieve
+        """
+        # Convert tensor to numpy array
+        x_np = x.cpu().numpy()
+
+        # Build the nearest neighbors model
         from sklearn.neighbors import NearestNeighbors
 
-        nn = NearestNeighbors(n_neighbors=k + 1, algorithm="auto", metric="euclidean")
-        nn.fit(x.cpu().numpy())
-        d, _ = nn.kneighbors(x.cpu().numpy())
-        return d[:, 1:].astype(np.float32), None
+        nn_model = NearestNeighbors(n_neighbors=k + 1, algorithm="auto", metric="euclidean").fit(x_np)
 
-    def set_background(self, bg):
-        self.background_color = bg
+        # Find the k-nearest neighbors
+        distances, indices = nn_model.kneighbors(x_np)
+
+        # Exclude the point itself from the result and return
+        return distances[:, 1:].astype(np.float32), indices[:, 1:].astype(np.float32)
+
+    def set_background(self, background_color: torch.Tensor):
+        assert background_color.shape == (3,)
+        self.background_color = background_color
 
     def step_post_backward(self, step):
         assert step == self.step
@@ -647,183 +750,245 @@ class SplatADModel(ADModel):
                 info=self.info,
                 lr=self.optimizers["means"].param_groups[0]["lr"],
             )
+        else:
+            raise NotImplementedError(f"Strategy {self.config.strategy} is not implemented.")
 
-    def get_training_callbacks(self, attrs):
-        return [
+    def get_training_callbacks(
+        self, training_callback_attributes: TrainingCallbackAttributes
+    ) -> List[TrainingCallback]:
+        cbs = []
+        cbs.append(
             TrainingCallback(
                 [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
                 self.step_cb,
-                args=[attrs.optimizers],
-            ),
+                args=[training_callback_attributes.optimizers],
+            )
+        )
+        cbs.append(
             TrainingCallback(
                 [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
                 self.step_post_backward,
-            ),
-        ]
+            )
+        )
+        return cbs
 
-    def step_cb(self, optimizers, step):
+    def step_cb(self, optimizers: Optimizers, step):
         self.step = step
         self.optimizers = optimizers.optimizers
 
-    def get_gaussian_param_groups(self):
-        g = {
-            n: [self.gauss_params[n]]
-            for n in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
+    def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
+        # Here we explicitly use the means, scales as parameters so that the user can override this function and
+        # specify more if they want to add more optimizable params to gaussians.
+        return {
+            name: [self.gauss_params[name]]
+            for name in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
         }
-        if self.config.use_lidar_offset:
-            g["lidar_offsets"] = [self.gauss_params["lidar_offsets"]]
-        return g
 
-    def get_param_groups(self):
-        pg = super().get_param_groups()
-        pg.update(self.get_gaussian_param_groups())
-        self.camera_optimizer.get_param_groups(pg)
-        self.camera_velocity_optimizer.get_param_groups(pg)
-        pg["fields"] = (
-            list(self.rgb_decoder.parameters())
-            + list(self.appearance_embedding.parameters())
-            + list(self.lidar_decoder.parameters())
-        )
-        if self.config.use_dual_stream and self.raw_fog_beta is not None:
-            pg["fog_params"] = [self.raw_fog_beta, self.fog_atmospheric_light]
-        return pg
+    def get_param_groups(self) -> Dict[str, List[Parameter]]:
+        """Obtain the parameter groups for the optimizers
 
-    def _get_downscale_factor(self):
+        Returns:
+            Mapping of different parameter groups
+        """
+        param_groups = super().get_param_groups()
+        param_groups.update(self.get_gaussian_param_groups())
+        self.camera_optimizer.get_param_groups(param_groups=param_groups)
+        self.camera_velocity_optimizer.get_param_groups(param_groups=param_groups)
+        param_groups["fields"] = []
+
+        param_groups["fields"] += list(self.rgb_decoder.parameters())
+        param_groups["fields"] += list(self.appearance_embedding.parameters())
+
+        param_groups["fields"] += list(self.lidar_decoder.parameters())
+        return param_groups
+
+    def _get_downscale_factor(self) -> int:
         if self.training:
-            return 2 ** max((self.config.num_downscales - self.step // self.config.resolution_schedule), 0)
-        return 1
+            return 2 ** max(
+                (self.config.num_downscales - self.step // self.config.resolution_schedule),
+                0,
+            )
+        else:
+            return 1
 
-    def _downscale_if_required(self, im):
+    def _downscale_if_required(self, image):
         d = self._get_downscale_factor()
-        return resize_image(im, d) if d > 1 else im
+        if d > 1:
+            return resize_image(image, d)
+        return image
 
     def _get_background_color(self):
         if self.config.background_color == "random":
-            return torch.rand(3, device=self.device) if self.training else self.background_color.to(self.device)
-        return torch.tensor(get_color(self.config.background_color), device=self.device)
+            if self.training:
+                background = torch.rand(3, device=self.device)
+            else:
+                self.background_color = self.background_color.to(self.device)
+                background = self.background_color.to(self.device)
+        elif self.config.background_color == "white":
+            background = torch.ones(3, device=self.device)
+        elif self.config.background_color == "black":
+            background = torch.zeros(3, device=self.device)
+        else:
+            raise ValueError(f"Unknown background color {self.config.background_color}")
+        return background
 
-    def _get_actor_adjusted_means(self, means, times, ids, calc_vels=True):
-        miw = means.clone()
-        b2w, _ = self.dynamic_actors.get_boxes2world(times, flatten=False)
-        b2w = b2w.squeeze(0)
-
+    def _get_actor_adjusted_means(
+        self, means: torch.Tensor, times: torch.Tensor, ids: torch.Tensor, calc_vels: bool = True
+    ):
+        means_in_world = means.clone()
+        boxes2world, _ = self.dynamic_actors.get_boxes2world(times, flatten=False)
+        boxes2world = boxes2world.squeeze(0)
         if self.training:
-            fm = torch.eye(4, device=b2w.device).unsqueeze(0).repeat(b2w.shape[0], 1, 1)
-            fm[:, 0, 0] += (
-                (torch.rand(b2w.shape[0], device=b2w.device) < self.config.actor_flip_probability) * -2
+            flip_matrix = torch.eye(4, device=boxes2world.device).unsqueeze(0).repeat(boxes2world.shape[0], 1, 1)
+            flip_matrix[:, 0, 0] += (
+                (torch.rand(boxes2world.shape[0], device=boxes2world.device)) < self.config.actor_flip_probability
+            ) * -2
+            boxes2world = boxes2world @ flip_matrix
+        boxes2world = boxes2world[..., :3, :]  # remove the last row of the pose matrix
+        num_actors = self.dynamic_actors.actor_sizes.shape[0]
+        actor_idx = (ids < num_actors).squeeze().nonzero().squeeze()
+        curr_ids = ids.index_select(0, actor_idx).squeeze().to(torch.long)
+
+        vels_in_world = None
+        b2w_per_pt = boxes2world.index_select(dim=0, index=curr_ids)
+        if calc_vels and len(boxes2world) > 0:
+            lin_vel, ang_vel = self.dynamic_actors.get_velocities(times).split([3, 3], dim=-1)
+            lin_vel = lin_vel.squeeze(0).squeeze(0)
+            ang_vel = ang_vel.squeeze(0).squeeze(0)
+
+            vels_in_world = torch.zeros_like(means)
+            angle_vel_in_box = torch.cross(
+                ang_vel.index_select(dim=0, index=curr_ids), means.index_select(0, actor_idx)
             )
-            b2w = b2w @ fm
-        b2w = b2w[..., :3, :]
+            vels_in_world[actor_idx] += lin_vel.index_select(dim=0, index=curr_ids) + transform_points_pairwise(
+                angle_vel_in_box, b2w_per_pt, with_translation=False
+            )
 
-        na = self.dynamic_actors.actor_sizes.shape[0]
-        actor_mask = (ids < na).squeeze()
+        means_in_world[actor_idx] = transform_points_pairwise(means_in_world.index_select(0, actor_idx), b2w_per_pt)
 
-        vels = None
-        if calc_vels:
-            vels = torch.zeros_like(means)
+        return means_in_world, vels_in_world
 
-        if actor_mask.any():
-            ai = actor_mask.nonzero().squeeze(-1)
-            ci = ids.index_select(0, ai).squeeze().long()
-            bp = b2w.index_select(0, ci)
-            if calc_vels and len(b2w) > 0:
-                lv, av = self.dynamic_actors.get_velocities(times).split([3, 3], -1)
-                lv = lv.squeeze(0).squeeze(0)
-                av = av.squeeze(0).squeeze(0)
-                vels[ai] += lv.index_select(0, ci) + transform_points_pairwise(
-                    torch.cross(av.index_select(0, ci), means.index_select(0, ai)),
-                    bp,
-                    with_translation=False,
-                )
-            miw[ai] = transform_points_pairwise(miw.index_select(0, ai), bp)
-        return miw, vels
+    def get_camera_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
+        """Takes in a camera and returns a dictionary of outputs.
 
-    # ------------------------------------------------------------------
-    # Camera rendering (per-Gaussian ASM)
-    # ------------------------------------------------------------------
-    def get_camera_outputs(self, camera: Cameras) -> Dict:
+        Args:
+            camera: The camera(s) for which output images are rendered. It should have
+            all the needed information to compute the outputs.
+
+        Returns:
+            Outputs of model. (ie. rendered colors)
+        """
         if not isinstance(camera, Cameras):
+            print("Called get_outputs with not a camera")
             return {}
 
         if self.training or self.config.use_camopt_in_eval:
-            assert camera.shape[0] == 1
-            oc2w = self.camera_optimizer.apply_to_camera(camera)
+            assert camera.shape[0] == 1, "Only one camera at a time"
+            optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)
         else:
-            oc2w = camera.camera_to_worlds
+            optimized_camera_to_world = camera.camera_to_worlds
 
-        BLK = 16
-        csf = self._get_downscale_factor()
-        if csf != 1:
-            camera.rescale_output_resolution(1 / csf)
-
+        BLOCK_WIDTH = 16  # this controls the tile size of rasterization, 16 is a good default
+        camera_scale_fac = self._get_downscale_factor()
+        if camera_scale_fac != 1:
+            camera.rescale_output_resolution(1 / camera_scale_fac)
         K = camera.get_intrinsics_matrices()
         W, H = int(camera.width.item()), int(camera.height.item())
         self.last_size = (H, W)
-        rd = get_ray_dirs_pinhole(camera, W, H, oc2w)
+        ray_dirs = get_ray_dirs_pinhole(camera, W, H, optimized_camera_to_world)
+        if camera_scale_fac != 1:
+            camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
 
-        if csf != 1:
-            camera.rescale_output_resolution(csf)
+        # apply the compensation of screen space blurring to gaussians
+        if self.config.rasterize_mode not in ["antialiased", "classic"]:
+            raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
 
-        render_mode = "RGB+ED"
-        clv = cav = None
-        rst = None
-        ctimes = camera.times
-
-        if camera.metadata is not None and self.config.compensate_rs_camera:
-            rst = camera.metadata.get("rolling_shutter_time", torch.zeros((1, 1), device=self.device))[0]
-            tcp = camera.metadata.get("time_to_center_pixel", torch.zeros((1, 1), device=self.device))
-            vels = self.camera_velocity_optimizer.apply_to_camera_velocity(
-                camera,
-                return_init_only=(not self.training) and (not self.config.use_camopt_in_eval),
-            )
-            clv, cav = torch.split(vels, 3, -1)
-            tcp = tcp + self.camera_velocity_optimizer.get_time_to_center_pixel_adjustment(camera)
-            oc2w = torch.cat(
-                [
-                    oc2w[:, :3, :3],
-                    oc2w[:, :3, 3:4]
-                    + (torch.matmul(clv, oc2w[0, :3, :3].transpose(0, 1)) * tcp)[..., None],
-                ],
-                -1,
-            )
-            ctimes = camera.times + tcp
-            ft = torch.ones(3, device=clv.device, dtype=clv.dtype)
-            ft[1:] = -1
-            clv = clv * ft
-            cav = cav * ft
+        if self.config.output_depth_during_training or not self.training:
+            render_mode = "RGB+ED"
         else:
-            clv = torch.tensor(
+            render_mode = "RGB"
+
+        colors = torch.cat((self.features_dc, self.features_rest), dim=-1)
+
+        # rolling shutter
+        camera_linear_vel = None
+        camera_angular_vel = None
+        rolling_shutter_time = None
+        camera_times = camera.times
+        if camera.metadata is not None and self.config.compensate_rs_camera:
+            rolling_shutter_time = camera.metadata.get(
+                "rolling_shutter_time",
+                torch.zeros(
+                    (
+                        1,
+                        1,
+                    ),
+                    device=self.device,
+                ),
+            )[0]
+            time_to_center_pixel = camera.metadata.get(
+                "time_to_center_pixel",
+                torch.zeros(
+                    (
+                        1,
+                        1,
+                    ),
+                    device=self.device,
+                ),
+            )
+            velocities = self.camera_velocity_optimizer.apply_to_camera_velocity(
+                camera, return_init_only=(not self.training) and (not self.config.use_camopt_in_eval)
+            )
+            camera_linear_vel, camera_angular_vel = torch.split(velocities, 3, dim=-1)
+            time_to_center_pixel = (
+                time_to_center_pixel + self.camera_velocity_optimizer.get_time_to_center_pixel_adjustment(camera)
+            )
+            optimized_camera_to_world = torch.cat(
+                [
+                    optimized_camera_to_world[:, :3, :3],
+                    optimized_camera_to_world[:, :3, 3:4]
+                    + (
+                        torch.matmul(camera_linear_vel, optimized_camera_to_world[0, :3, :3].transpose(0, 1))
+                        * (time_to_center_pixel)
+                    )[..., None],
+                ],
+                dim=-1,
+            )
+            camera_times = camera.times + time_to_center_pixel
+
+            flip_tensor = torch.ones(3, device=camera_linear_vel.device, dtype=camera_linear_vel.dtype)
+            flip_tensor[1:] = -1
+            camera_linear_vel = camera_linear_vel * flip_tensor  # flip y and z
+            camera_angular_vel = camera_angular_vel * flip_tensor  # flip y and z
+        else:
+            camera_linear_vel = torch.tensor(
                 [[self.rs_editing["lin_vel_x"], self.rs_editing["lin_vel_y"], self.rs_editing["lin_vel_z"]]],
                 device=self.device,
             )
-            cav = torch.tensor(
+            camera_angular_vel = torch.tensor(
                 [[self.rs_editing["ang_vel_x"], self.rs_editing["ang_vel_y"], self.rs_editing["ang_vel_z"]]],
                 device=self.device,
             )
-            rst = torch.tensor([self.rs_editing["rs_time"]], device=self.device)
+            rolling_shutter_time = torch.tensor([self.rs_editing["rs_time"]], device=self.device)
 
-        vm = get_viewmat(oc2w)
-        means_w, vels = self._get_actor_adjusted_means(self.means, ctimes, self.id)
+        viewmat = get_viewmat(optimized_camera_to_world)
+        means, vels = self._get_actor_adjusted_means(self.means, camera_times, self.id)
 
-        surf_op = torch.sigmoid(self.opacities).squeeze(-1)
-        surf_colors = torch.cat((self.features_dc, self.features_rest), -1)
-
-        # Surface rasterization -> features + depth
-        render_s, alpha, self.info = rasterization(
-            means=means_w,
+        render, alpha, self.info = rasterization(
+            means=means,
             quats=self.quats,
             scales=torch.exp(self.scales),
-            opacities=surf_op,
-            colors=surf_colors,
+            opacities=torch.sigmoid(self.opacities).squeeze(-1),
+            colors=colors,
             velocities=vels,
-            viewmats=vm,
-            Ks=K,
+            viewmats=viewmat,  # [1, 4, 4]
+            Ks=K,  # [1, 3, 3]
             width=W,
             height=H,
-            linear_velocity=clv,
-            angular_velocity=cav,
-            rolling_shutter_time=rst,
-            tile_size=BLK,
+            linear_velocity=camera_linear_vel,
+            angular_velocity=camera_angular_vel,
+            rolling_shutter_time=rolling_shutter_time,
+            tile_size=BLOCK_WIDTH,
             packed=False,
             near_plane=0.5,
             far_plane=1e10,
@@ -841,195 +1006,157 @@ class SplatADModel(ADModel):
                 self.gauss_params, self.optimizers, self.strategy_state, self.step, self.info
             )
 
-        bg = self._get_background_color()
-        r_feat = render_s[..., :-1]   # [1, H, W, 3]
-        raw_d = render_s[..., -1:]     # [1, H, W, 1]
+        background = self._get_background_color()
 
-        # CNN decoder -> clean RGB
-        af = self._get_appearance_embedding(camera, r_feat)
-        rgb_clean = self.rgb_decoder(torch.cat((r_feat, af), -1), rd.unsqueeze(0))
-        rgb_clean = rgb_clean + (1 - alpha) * bg
-        rgb_clean = torch.clamp(rgb_clean, 0.0, 1.0)
+        rendered_features = render[..., :-1] if render_mode == "RGB+ED" else render
+        appearance_features = self._get_appearance_embedding(camera, rendered_features)
+        rendered_features = torch.cat((rendered_features, appearance_features), dim=-1)
+        rgb = self.rgb_decoder(rendered_features, ray_dirs.unsqueeze(0))
+        rgb = rgb + (1 - alpha) * background
 
-        # Environment stream: per-Gaussian t -> t_map -> ASM composition
-        should_fog = (
-            self.config.use_dual_stream
-            and self.raw_fog_beta is not None
-            and (self.training or (self.config.render_weather and self.render_weather_slider.value > 0.5))
-        )
-        t_map = None
-        if should_fog:
-            beta = F.softplus(self.raw_fog_beta) + self.config.fog_beta_min
+        rgb = torch.clamp(rgb, 0.0, 1.0)
 
-            # Per-Gaussian camera-space depth — detach protects geometry
-            means_h = torch.cat([means_w, torch.ones_like(means_w[..., :1])], -1)
-            means_cam = (vm[0] @ means_h.T).T
-            d_gauss = means_cam[..., 2].detach().clamp(min=0.5)
-            t_per_gauss = torch.clamp(torch.exp(-beta * d_gauss), min=self.config.fog_t_min)
-
-            # Second raster: t_map
-            t_render, _, _ = rasterization(
-                means=means_w,
-                quats=self.quats,
-                scales=torch.exp(self.scales),
-                opacities=surf_op,
-                colors=t_per_gauss.unsqueeze(-1),
-                velocities=vels,
-                viewmats=vm,
-                Ks=K,
-                width=W,
-                height=H,
-                linear_velocity=clv,
-                angular_velocity=cav,
-                rolling_shutter_time=rst,
-                tile_size=BLK,
-                packed=False,
-                near_plane=0.5,
-                far_plane=1e10,
-                radius_clip=self.config.radius_clip_pix,
-                render_mode="RGB",
-                sh_degree=None,
-                sparse_grad=False,
-                absgrad=False,
-                rasterize_mode=self.config.rasterize_mode,
-                channel_chunk=128,
-                eps2d=0.3,
-            )
-            t_map = t_render.squeeze(-1).unsqueeze(-1)   # [1, H, W, 1]
-            fog_A = torch.sigmoid(self.fog_atmospheric_light)   # [3]
-            rgb = rgb_clean * t_map + fog_A.view(1, 1, 1, 3) * (1.0 - t_map)
-            rgb = torch.clamp(rgb, 0.0, 1.0)
-        else:
-            rgb = rgb_clean
-
-        # Depth output
-        if self.config.output_depth_during_training or not self.training:
-            depth_im = torch.where(alpha > 0, raw_d, raw_d.detach().max()).squeeze(0)
+        if render_mode == "RGB+ED":
+            depth_im = render[:, ..., -1:]
+            depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max()).squeeze(0)
         else:
             depth_im = None
 
-        if bg.shape[0] == 3 and not self.training:
-            bg = bg.expand(H, W, 3)
+        if background.shape[0] == 3 and not self.training:
+            background = background.expand(H, W, 3)
 
         out = {
-            "rgb": rgb.squeeze(0),
-            "depth": depth_im,
-            "accumulation": alpha.squeeze(0),
-            "background": bg,
-        }
-        if t_map is not None:
-            out["t_map"] = t_map
+            "rgb": rgb.squeeze(0),  # type: ignore
+            "depth": depth_im,  # type: ignore
+            "accumulation": alpha.squeeze(0),  # type: ignore
+            "background": background,  # type: ignore
+        }  # type: ignore
+
         return out
 
-    # ------------------------------------------------------------------
-    # LiDAR rendering
-    # ------------------------------------------------------------------
-    def get_lidar_outputs(self, lidar: Lidars) -> Dict:
-        if not isinstance(lidar, Lidars):
-            return {}
-        assert (lidar.azimuths is not None and lidar.elevations is not None) or (
-            lidar.metadata and "raster_pts" in lidar.metadata
-        )
+    def get_lidar_outputs(self, lidar: Lidars) -> Dict[str, Union[torch.Tensor, List]]:
+        """Takes in a camera and returns a dictionary of outputs.
 
+        Args:
+            camera: The camera(s) for which output images are rendered. It should have
+            all the needed information to compute the outputs.
+
+        Returns:
+            Outputs of model. (ie. rendered colors)
+        """
+        if not isinstance(lidar, Lidars):
+            print("Called get_outputs with not a camera")
+            return {}
+        assert (
+            (lidar.azimuths is not None and lidar.elevations is not None)
+            or lidar.metadata
+            and "raster_pts" in lidar.metadata
+        )
         if self.training or self.config.use_camopt_in_eval:
-            assert lidar.shape[0] == 1
-            ol2w = self.camera_optimizer.apply_to_camera(lidar)
+            assert lidar.shape[0] == 1, "Only one camera at a time"
+            optimized_lidar_to_world = self.camera_optimizer.apply_to_camera(lidar)
         else:
-            ol2w = lidar.lidar_to_worlds
+            optimized_lidar_to_world = lidar.lidar_to_worlds
+
+        # apply the compensation of screen space blurring to gaussians
+        if self.config.rasterize_mode not in ["antialiased", "classic"]:
+            raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
 
         if lidar.metadata and "raster_pts" in lidar.metadata:
-            raster_pts = lidar.metadata["raster_pts"][..., :-1]
-            tb = lidar.metadata["elevation_boundaries"]
-            ma = -180
-            Ma = 180
-            me = tb.min()
-            Me = tb.max()
-            ar = lidar.metadata["azimuth_resolution"]
+            raster_pts = lidar.metadata["raster_pts"][
+                ..., :-1
+            ]  # omit intensity channel, only needed for metric/loss computation
+            tile_elevation_boundaries = lidar.metadata["elevation_boundaries"]
+            min_azimuth = -180
+            max_azimuth = 180
+            min_elevation = tile_elevation_boundaries.min()
+            max_elevation = tile_elevation_boundaries.max()
+            azimuth_resolution = lidar.metadata["azimuth_resolution"]
         else:
-            ev, az = torch.meshgrid(
-                torch.rad2deg(lidar.elevations.flatten()),
-                torch.rad2deg(lidar.azimuths.flatten()),
-                indexing="ij",
+            elevs, azims = torch.meshgrid(
+                torch.rad2deg(lidar.elevations.flatten()), torch.rad2deg(lidar.azimuths.flatten())
             )
-            raster_pts = (
-                torch.stack([az, ev, torch.ones_like(az), torch.zeros_like(az)], -1)
-                .to(self.device)[None]
-            )
-            tb = torch.rad2deg(lidar.elevations[0, ::ELEV_CHANNELS_PER_TILE]).to(self.device).flatten()
-            tb = torch.cat([tb, torch.tensor([tb[-1].item() + 1], device=self.device)])
-            ar = float(torch.rad2deg(lidar.azimuths[0, 1] - lidar.azimuths[0, 0]))
-            ma = -180
-            Ma = 180
-            me = tb.min().item()
-            Me = tb.max().item() + 1e-6
-
-        llv = torch.zeros(1, 3, device=self.device)
-        lav = torch.zeros(1, 3, device=self.device)
-        rst_l = torch.zeros(1, device=self.device)
-        lt = lidar.times
-
-        if lidar.metadata is not None and self.config.compensate_rs_lidar:
-            mxo, mno = raster_pts[..., 3].max(), raster_pts[..., 3].min()
-            rst_l = (mxo - mno).unsqueeze(0)
-            vels = self.camera_velocity_optimizer.apply_to_camera_velocity(
-                lidar,
-                return_init_only=(not self.training) and (not self.config.use_camopt_in_eval),
-            )
-            llv, lav = torch.split(vels, 3, -1)
-            tca = (mxo + mno) / 2
-            ol2w = torch.cat(
+            raster_pts = torch.stack([azims, elevs, torch.ones_like(azims), torch.zeros_like(azims)], dim=-1).to(
+                self.device
+            )[None]
+            tile_elevation_boundaries = torch.rad2deg(lidar.elevations[0, ::ELEV_CHANNELS_PER_TILE]).to(self.device)
+            tile_elevation_boundaries = tile_elevation_boundaries.flatten()
+            tile_elevation_boundaries = torch.cat(
                 [
-                    ol2w[:, :3, :3],
-                    ol2w[:, :3, 3:4]
-                    + (torch.einsum("bij,bj->bi", ol2w[..., :3, :3], llv) * tca)[..., None],
-                ],
-                -1,
+                    tile_elevation_boundaries,
+                    torch.tensor([tile_elevation_boundaries[..., -1].item() + 1], device=self.device),
+                ]
             )
-            lt = lidar.times + tca
-            raster_pts[..., 3] = raster_pts[..., 3] - tca
+            azimuth_resolution = float(torch.rad2deg((lidar.azimuths[0, 1] - lidar.azimuths[0, 0])))
+            min_azimuth = -180
+            max_azimuth = 180
+            min_elevation = tile_elevation_boundaries.min().item()
+            max_elevation = tile_elevation_boundaries.max().item() + 1e-6
 
-        lf = self.features_rest.unsqueeze(0)
-        bs = raster_pts.shape[0]
-        vm_l = to4x4(pose_inverse(ol2w))
+        # rolling shutter
+        lidar_linear_vel = torch.zeros(1, 3, device=self.device)
+        lidar_angular_vel = torch.zeros(1, 3, device=self.device)
+        rolling_shutter_time = torch.zeros(1, device=self.device)
+        lidar_times = lidar.times
+        if lidar.metadata is not None and self.config.compensate_rs_lidar:
+            max_offset, min_offset = raster_pts[..., 3].max(), raster_pts[..., 3].min()
+            rolling_shutter_time = (max_offset - min_offset).unsqueeze(0)
+            velocities = self.camera_velocity_optimizer.apply_to_camera_velocity(
+                lidar, return_init_only=(not self.training) and (not self.config.use_camopt_in_eval)
+            )
+            lidar_linear_vel, lidar_angular_vel = torch.split(velocities, 3, dim=-1)
 
-        if bs > 1:
-            vm_l = vm_l.repeat(bs, 1, 1)
-            lf = lf.repeat(bs, 1, 1)
-            llv = llv.repeat(bs, 1)
-            lav = lav.repeat(bs, 1)
-            rst_l = rst_l.repeat(bs)
+            time_to_center_adjustment = (max_offset + min_offset) / 2
+            optimized_lidar_to_world = torch.cat(
+                [
+                    optimized_lidar_to_world[:, :3, :3],
+                    optimized_lidar_to_world[:, :3, 3:4]
+                    + (
+                        (torch.einsum("bij,bj->bi", optimized_lidar_to_world[..., :3, :3], lidar_linear_vel))
+                        * time_to_center_adjustment
+                    )[..., None],
+                ],
+                dim=-1,
+            )
+            lidar_times = lidar.times + time_to_center_adjustment
+            raster_pts[..., 3] = raster_pts[..., 3] - time_to_center_adjustment
 
-        # Innovation 2: LiDAR uses mu + offset, camera uses mu
-        lidar_means = self.means + (
-            self.gauss_params["lidar_offsets"] if self.config.use_lidar_offset else 0
-        )
-        means, vels = self._get_actor_adjusted_means(lidar_means, lt, self.id)
+        lidar_features = self.features_rest.unsqueeze(0)
+        batch_size = raster_pts.shape[0]
+        viewmat = to4x4(pose_inverse(optimized_lidar_to_world))
+        if batch_size > 1:
+            viewmat = viewmat.repeat(batch_size, 1, 1)
+            lidar_features = lidar_features.repeat(batch_size, 1, 1)
+            lidar_linear_vel = lidar_linear_vel.repeat(batch_size, 1)
+            lidar_angular_vel = lidar_angular_vel.repeat(batch_size, 1)
+            rolling_shutter_time = rolling_shutter_time.repeat(batch_size)
 
-        render, alpha, asup, self.info = lidar_rasterization(
+        means, vels = self._get_actor_adjusted_means(self.means, lidar_times, self.id)
+        render, alpha, alpha_sum_until_points, self.info = lidar_rasterization(
             means=means,
             quats=self.quats,
             scales=torch.exp(self.scales),
             opacities=torch.sigmoid(self.opacities).squeeze(-1),
-            lidar_features=lf,
+            lidar_features=lidar_features,  # [(C,) N, D]
             velocities=vels,
-            viewmats=vm_l,
-            min_azimuth=ma,
-            max_azimuth=Ma,
-            min_elevation=me,
-            max_elevation=Me,
+            viewmats=viewmat,  # [1, 4, 4]
+            min_azimuth=min_azimuth,
+            max_azimuth=max_azimuth,
+            min_elevation=min_elevation,
+            max_elevation=max_elevation,
             n_elevation_channels=raster_pts.shape[1],
-            azimuth_resolution=ar,
-            raster_pts=raster_pts,
+            azimuth_resolution=azimuth_resolution,
+            raster_pts=raster_pts,  # [C, H, W, 4]
             tile_width=AZIM_CHANNELS_PER_TILE,
             tile_height=ELEV_CHANNELS_PER_TILE,
-            tile_elevation_boundaries=tb,
-            linear_velocity=llv,
-            angular_velocity=lav,
-            rolling_shutter_time=rst_l,
+            tile_elevation_boundaries=tile_elevation_boundaries,
+            linear_velocity=lidar_linear_vel,
+            angular_velocity=lidar_angular_vel,
+            rolling_shutter_time=rolling_shutter_time,
             near_plane=0.2,
             far_plane=300,
             radius_clip=self.config.radius_clip_lidar,
-            compute_alpha_sum_until_points=(self.config.line_of_sight_lambda > 0) and self.training,
+            compute_alpha_sum_until_points=(self.config.line_of_sight_lambda > 0) and (self.training),
             compute_alpha_sum_until_points_threshold=self.config.line_of_sight_dist,
             sparse_grad=False,
             absgrad=self.config.use_absgrad,
@@ -1040,308 +1167,353 @@ class SplatADModel(ADModel):
         self.info["width"] = -1
         self.info["height"] = -1
         self.last_size = (self.last_size[0], self.last_size[1], -1)
-
+        # TODO(carlin): Add this back if we want to start pruning based on 2D size in lidar image space.
+        # self.xys = info["means2d"]  # [1, N, 2]
+        # self.radii = info["radii"][0]  # [N]
         if self.training:
             self.strategy.step_pre_backward(
                 self.gauss_params, self.optimizers, self.strategy_state, self.step, self.info
             )
 
-        di = render[:,..., -1:]
-        rf = render[..., :-1]
-        af_l = self._get_appearance_embedding(lidar, rf)
-        rf = torch.cat((rf, af_l), -1)
+        depth_im = render[:, ..., -1:]
 
-        rd_l = torch.deg2rad(raster_pts[..., :2])
-        lrd = torch.cat(
+        rendered_features = render[..., :-1]
+        appearance_features = self._get_appearance_embedding(lidar, rendered_features)
+        rendered_features = torch.cat((rendered_features, appearance_features), dim=-1)
+        raster_pts_degrees = torch.deg2rad(raster_pts[..., :2])
+        lidar_ray_dir = torch.cat(
             [
-                torch.cos(rd_l[..., 0:1]) * torch.cos(rd_l[..., 1:2]),
-                torch.sin(rd_l[..., 0:1]) * torch.cos(rd_l[..., 1:2]),
-                torch.sin(rd_l[..., 1:2]),
+                torch.cos(raster_pts_degrees[..., 0:1])
+                * torch.cos(raster_pts_degrees[..., 1:2]),  # x = cos(azimuth) * cos(elevation)
+                torch.sin(raster_pts_degrees[..., 0:1])
+                * torch.cos(raster_pts_degrees[..., 1:2]),  # y = sin(azimuth) * cos(elevation)
+                torch.sin(raster_pts_degrees[..., 1:2]),  # z = sin(elevation)
             ],
-            -1,
+            dim=-1,
         )
-        lrdw = (ol2w[:, :3, :3].reshape(1, 1, 1, 3, 3) @ lrd.unsqueeze(-1)).squeeze(-1)
+        lidar_ray_dir_in_world = (
+            optimized_lidar_to_world[:, :3, :3].reshape(1, 1, 1, 3, 3) @ lidar_ray_dir.unsqueeze(-1)
+        ).squeeze(-1)
 
-        intensity, rdl = (
+        intensity, ray_drop_logits = (
             self.lidar_decoder(
                 torch.cat(
-                    [rf.reshape(-1, rf.shape[-1]), lrdw.reshape(-1, lrdw.shape[-1])],
-                    -1,
+                    [
+                        rendered_features.reshape(-1, rendered_features.shape[-1]),
+                        lidar_ray_dir_in_world.reshape(-1, lidar_ray_dir_in_world.shape[-1]),
+                    ],
+                    dim=-1,
                 )
             )
-            .reshape((*lrdw.shape[:-1], self.lidar_decoder.out_dim))
-            .split([1, 1], -1)
+            .reshape((*lidar_ray_dir_in_world.shape[:-1], self.lidar_decoder.out_dim))
+            .split([1, 1], dim=-1)
         )
 
         out = {
-            "depth": di,
-            "accumulation": alpha,
+            "depth": depth_im,  # type: ignore
+            "accumulation": alpha,  # type: ignore
             "median_depth": self.info["median_depths"]
-            + (alpha <= 0.5) * (di / alpha.clamp_min(1e-10)),
-        }
+            + (alpha <= 0.5)
+            * (depth_im / alpha.clamp_min(1e-10)),  # add normalized expected depth where we did not reach alpha=0.5
+        }  # type: ignore
+
         if intensity is not None:
-            out["intensity"] = intensity.sigmoid().float()
-        if rdl is not None:
-            out["ray_drop_logits"] = rdl.float()
-            out["ray_drop_prob"] = rdl.sigmoid().float()
-        if asup is not None:
-            out["alpha_sum_until_points"] = asup
-        return out
+            out["intensity"] = intensity.sigmoid().to(torch.float32)
 
-    def get_outputs(self, sensor):
-        return self.get_camera_outputs(sensor) if isinstance(sensor, Cameras) else self.get_lidar_outputs(sensor)
+        if ray_drop_logits is not None:
+            out["ray_drop_logits"] = ray_drop_logits.to(torch.float32)
+            out["ray_drop_prob"] = ray_drop_logits.sigmoid().to(torch.float32)
 
-    # ------------------------------------------------------------------
-    # Metrics / Loss
-    # ------------------------------------------------------------------
-    def get_gt_img(self, image):
+        if alpha_sum_until_points is not None:
+            out["alpha_sum_until_points"] = alpha_sum_until_points
+
+        return out  # type: ignore
+
+    def get_outputs(self, sensor: Union[Cameras, Lidars]) -> Dict[str, Union[torch.Tensor, List]]:
+        if isinstance(sensor, Cameras):
+            return self.get_camera_outputs(sensor)
+        elif isinstance(sensor, Lidars):
+            return self.get_lidar_outputs(sensor)
+        else:
+            raise ValueError("Unknown sensor type")
+
+    def get_gt_img(self, image: torch.Tensor):
+        """Compute groundtruth image with iteration dependent downscale factor for evaluation purpose
+
+        Args:
+            image: tensor.Tensor in type uint8 or float32
+        """
         if image.dtype == torch.uint8:
             image = image.float() / 255.0
-        return self._downscale_if_required(image).to(self.device)
+        gt_img = self._downscale_if_required(image)
+        return gt_img.to(self.device)
 
-    def composite_with_background(self, image, bg):
+    def composite_with_background(self, image, background) -> torch.Tensor:
+        """Composite the ground truth image with a background color when it has an alpha channel.
+
+        Args:
+            image: the image to composite
+            background: the background color
+        """
         if image.shape[2] == 4:
-            a = image[..., -1].unsqueeze(-1).repeat((1, 1, 3))
-            return a * image[..., :3] + (1 - a) * bg
-        return image
+            alpha = image[..., -1].unsqueeze(-1).repeat((1, 1, 3))
+            return alpha * image[..., :3] + (1 - alpha) * background
+        else:
+            return image
 
     def filter_lidar_pred_and_gt(self, outputs, batch, output_point_cloud=False):
-        gl = batch["raster_pts"]
-        v = batch["raster_pts_valid_depth_and_did_return"]
-        dr = batch["raster_pts_did_return"].flatten()
-        vn = batch["raster_pts_valid_depth_and_did_not_return"]
+        gt_lidar = batch["raster_pts"]  # (azimuth, elev, depth, time, intensity)
+        raster_pts_valid_and_did_return = batch["raster_pts_valid_depth_and_did_return"]
+        raster_pts_did_return = batch["raster_pts_did_return"].flatten()
+        raster_pts_valid_and_did_not_return = batch["raster_pts_valid_depth_and_did_not_return"]
 
-        gt = {
-            "depth": gl[..., 2].flatten()[v],
-            "intensity": gl[..., 4].flatten()[v],
-            "ray_drop": ~dr,
-            "valid": gl[..., 2].flatten() > 0,
-        }
-        pred = {
-            "depth": outputs["depth"].flatten()[v],
-            "depth_dropped": outputs["depth"].flatten()[vn],
-            "intensity": outputs["intensity"].flatten()[v],
-            "intensity_dropped": outputs["intensity"].flatten()[vn],
-            "ray_drop": outputs["ray_drop_logits"].flatten() * gt["valid"] - (~gt["valid"]) * 10000,
-            "accumulation": outputs["accumulation"].flatten()[v],
-            "accumulation_dropped": outputs["accumulation"].flatten()[vn],
-            "median_depth": outputs["median_depth"].flatten()[v],
-        }
+        gt = {}
+        gt["depth"] = gt_lidar[..., 2].flatten()[raster_pts_valid_and_did_return]
+        gt["intensity"] = gt_lidar[..., 4].flatten()[raster_pts_valid_and_did_return]
+        gt["ray_drop"] = ~raster_pts_did_return
+        gt["valid"] = gt_lidar[..., 2].flatten() > 0
+
+        pred = {}
+        pred["depth"] = outputs["depth"].flatten()[raster_pts_valid_and_did_return]
+        pred["depth_dropped"] = outputs["depth"].flatten()[raster_pts_valid_and_did_not_return]
+        pred["intensity"] = outputs["intensity"].flatten()[raster_pts_valid_and_did_return]
+        pred["intensity_dropped"] = outputs["intensity"].flatten()[raster_pts_valid_and_did_not_return]
+        pred["ray_drop"] = outputs["ray_drop_logits"].flatten() * gt["valid"] - (~gt["valid"]) * 10_000
+        pred["accumulation"] = outputs["accumulation"].flatten()[raster_pts_valid_and_did_return]
+        pred["accumulation_dropped"] = outputs["accumulation"].flatten()[raster_pts_valid_and_did_not_return]
+        pred["median_depth"] = outputs["median_depth"].flatten()[raster_pts_valid_and_did_return]
+
         if "alpha_sum_until_points" in outputs:
-            pred["alpha_sum_until_points"] = outputs["alpha_sum_until_points"].flatten()[v]
-            pred["alpha_sum_until_points_dropped"] = outputs["alpha_sum_until_points"].flatten()[vn]
+            pred["alpha_sum_until_points"] = outputs["alpha_sum_until_points"].flatten()[
+                raster_pts_valid_and_did_return
+            ]
+            pred["alpha_sum_until_points_dropped"] = outputs["alpha_sum_until_points"].flatten()[
+                raster_pts_valid_and_did_not_return
+            ]
 
         if output_point_cloud:
-            ad = torch.deg2rad(gl[..., 0].flatten())
-            ed = torch.deg2rad(gl[..., 1].flatten())
-            dirs = torch.stack([torch.cos(ed) * torch.cos(ad), torch.cos(ed) * torch.sin(ad), torch.sin(ed)], -1)
+            azimuth_angles = torch.deg2rad(gt_lidar[..., 0].flatten())
+            elevation_angles = torch.deg2rad(gt_lidar[..., 1].flatten())
+            directions = torch.stack(
+                [
+                    torch.cos(elevation_angles) * torch.cos(azimuth_angles),
+                    torch.cos(elevation_angles) * torch.sin(azimuth_angles),
+                    torch.sin(elevation_angles),
+                ],
+                dim=-1,
+            )
+
             gt["point_cloud"] = batch["lidar"][batch["lidar_pts_did_return"].squeeze(), :3]
             pred["point_cloud"] = (
-                outputs["depth"].view(-1, 1) * dirs
-                + batch["linear_velocities_local"] * gl[..., 3].view(-1, 1)
-            )[(pred["ray_drop"].sigmoid() <= 0.5) * gt["valid"]]
+                outputs["depth"].view(-1, 1) * directions
+                + batch["linear_velocities_local"] * gt_lidar[..., 3].view(-1, 1)
+            )[((pred["ray_drop"].sigmoid() <= 0.5) * gt["valid"])]
             pred["median_point_cloud"] = (
-                outputs["median_depth"].view(-1, 1) * dirs
-                + batch["linear_velocities_local"] * gl[..., 3].view(-1, 1)
-            )[(pred["ray_drop"].sigmoid() <= 0.5) * gt["valid"]]
+                outputs["median_depth"].view(-1, 1) * directions
+                + batch["linear_velocities_local"] * gt_lidar[..., 3].view(-1, 1)
+            )[((pred["ray_drop"].sigmoid() <= 0.5) * gt["valid"])]
+
         return pred, gt
 
-    def get_metrics_dict(self, outputs, batch):
-        md = {}
-        if "image" in batch:
-            gt = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
-            pr = outputs["rgb"]
-            if gt.shape[:2] != pr.shape[:2]:
-                gt = gt[: pr.shape[0], : pr.shape[1]]
-            md["psnr"] = self.psnr(pr, gt)
-            md["gaussian_count"] = self.num_points
-            if self.raw_fog_beta is not None:
-                md["fog_beta"] = float(
-                    F.softplus(self.raw_fog_beta) + self.config.fog_beta_min
-                )
-        if "raster_pts" in batch:
-            p, g = self.filter_lidar_pred_and_gt(outputs, batch)
-            vn = g["valid"].sum()
-            ra = (
-                float((((p["ray_drop"].sigmoid() > 0.5) == g["ray_drop"]) * g["valid"]).sum() / vn)
-                if vn > 0
-                else 0.0
-            )
-            md.update(
-                depth_median_l2=float(self.median_l2(p["depth"], g["depth"])),
-                depth_mean_rel_l2=float(self.mean_rel_l2(p["depth"], g["depth"])),
-                median_depth_median_l2=float(self.median_l2(p["median_depth"], g["depth"])),
-                median_depth_mean_rel_l2=float(self.mean_rel_l2(p["median_depth"], g["depth"])),
-                intensity_rmse=float(self.rmse(p["intensity"], g["intensity"])),
-                ray_drop_accuracy=ra,
-            )
-        self.camera_optimizer.get_metrics_dict(md)
-        self.camera_velocity_optimizer.get_metrics_dict(md)
-        return md
+    def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
+        """Compute and returns metrics.
 
-    def get_loss_dict(self, outputs, batch, metrics_dict=None):
-        ld = {}
+        Args:
+            outputs: the output to compute loss dict to
+            batch: ground truth batch corresponding to outputs
+        """
+        metrics_dict = {}
         if "image" in batch:
-            gt_img = self.composite_with_background(
-                self.get_gt_img(batch["image"]), outputs["background"]
-            )
+            gt_rgb = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
+
+            predicted_rgb = outputs["rgb"]
+            # slice gt_rgb to same shape as predicted_rgb
+            if not gt_rgb.shape[:2] == predicted_rgb.shape[:2]:
+                gt_rgb = gt_rgb[: predicted_rgb.shape[0], : predicted_rgb.shape[1], :]
+                # raise user warning
+                warnings.warn("GT image and predicted image have different shapes. Cropping GT image to match.")
+
+            metrics_dict["psnr"] = self.psnr(predicted_rgb, gt_rgb)
+
+            metrics_dict["gaussian_count"] = self.num_points
+
+        if "raster_pts" in batch:
+            pred, gt = self.filter_lidar_pred_and_gt(outputs, batch)
+
+            metrics_dict["depth_median_l2"] = float(self.median_l2(pred["depth"], gt["depth"]))
+            metrics_dict["depth_mean_rel_l2"] = float(self.mean_rel_l2(pred["depth"], gt["depth"]))
+            metrics_dict["median_depth_median_l2"] = float(self.median_l2(pred["median_depth"], gt["depth"]))
+            metrics_dict["median_depth_mean_rel_l2"] = float(self.mean_rel_l2(pred["median_depth"], gt["depth"]))
+            metrics_dict["intensity_rmse"] = float(self.rmse(pred["intensity"], gt["intensity"]))
+            metrics_dict["ray_drop_accuracy"] = (
+                ((pred["ray_drop"].sigmoid() > 0.5) == gt["ray_drop"]) * gt["valid"]
+            ).sum() / gt["valid"].sum()
+
+        self.camera_optimizer.get_metrics_dict(metrics_dict)
+        self.camera_velocity_optimizer.get_metrics_dict(metrics_dict)
+        return metrics_dict
+
+    def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
+        """Computes and returns the losses dict.
+
+        Args:
+            outputs: the output to compute loss dict to
+            batch: ground truth batch corresponding to outputs
+            metrics_dict: dictionary of metrics, some of which we can use for loss
+        """
+        loss_dict = {}
+        if "image" in batch:
+            gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
             pred_img = outputs["rgb"]
-            if gt_img.shape[:2] != pred_img.shape[:2]:
-                gt_img = gt_img[: pred_img.shape[0], : pred_img.shape[1]]
+            if not gt_img.shape[:2] == pred_img.shape[:2]:
+                gt_img = gt_img[: pred_img.shape[0], : pred_img.shape[1], :]
+                # raise user warning
+                warnings.warn("GT image and predicted image have different shapes. Cropping GT image to match.")
+
+            # Set masked part of both ground-truth and rendered image to black.
+            # This is a little bit sketchy for the SSIM loss.
             if "mask" in batch:
-                mk = self._downscale_if_required(batch["mask"]).to(self.device)
-                gt_img = gt_img * mk
-                pred_img = pred_img * mk
+                # batch["mask"] : [H, W, 1]
+                mask = self._downscale_if_required(batch["mask"])
+                mask = mask.to(self.device)
+                assert mask.shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
+                gt_img = gt_img * mask
+                pred_img = pred_img * mask
 
             Ll1 = torch.abs(gt_img - pred_img).mean()
             simloss = (
-                (
-                    1
-                    - self.ssim(
-                        gt_img.permute(2, 0, 1)[None, ...],
-                        pred_img.permute(2, 0, 1)[None, ...],
-                    )
-                )
+                1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
                 if self.config.ssim_lambda > 0
                 else 0
             )
-            ld["main_loss"] = (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss
+            loss_dict["main_loss"] = (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss
 
-            # sqrt depth-weighted reconstruction loss (balanced near/far)
-            if (
-                self.training
-                and self.config.depth_weighted_loss_lambda > 0
-                and "depth" in outputs
-                and outputs["depth"] is not None
-            ):
-                rd_dw = outputs["depth"]
-                if rd_dw.dim() == 3:
-                    rd_dw = rd_dw.squeeze(-1)
-                if rd_dw.shape[:2] != gt_img.shape[:2]:
-                    rd_dw = rd_dw[: gt_img.shape[0], : gt_img.shape[1]]
-                with torch.no_grad():
-                    dw = rd_dw.clamp(min=0.5).sqrt()
-                    dw = dw / (dw.mean() + 1e-8)
-                    dw = dw.unsqueeze(-1)
-                ld["depth_weighted_loss"] = self.config.depth_weighted_loss_lambda * (
-                    torch.abs(gt_img - pred_img) * dw
-                ).mean()
+        if self.config.mcmc_scale_reg_lambda and isinstance(self.strategy, ADMCMCStrategy):
+            mcmc_scale_reg = torch.abs(torch.exp(self.scales).mean()) * self.config.mcmc_scale_reg_lambda
+        else:
+            mcmc_scale_reg = torch.zeros(1, device=self.device)
 
-        ld["mcmc_scale_reg"] = (
-            torch.abs(torch.exp(self.scales).mean()) * self.config.mcmc_scale_reg_lambda
-            if self.config.mcmc_scale_reg_lambda and isinstance(self.strategy, ADMCMCStrategy)
-            else torch.zeros(1, device=self.device)
-        )
-        ld["mcmc_opacity_reg"] = (
-            torch.abs(torch.sigmoid(self.opacities).mean()) * self.config.mcmc_opacity_reg_lambda
-            if self.config.mcmc_opacity_reg_lambda and isinstance(self.strategy, ADMCMCStrategy)
-            else torch.zeros(1, device=self.device)
-        )
+        loss_dict["mcmc_scale_reg"] = mcmc_scale_reg
+
+        if self.config.mcmc_opacity_reg_lambda and isinstance(self.strategy, ADMCMCStrategy):
+            mcmc_opacity_reg = torch.abs(torch.sigmoid(self.opacities).mean()) * self.config.mcmc_opacity_reg_lambda
+        else:
+            mcmc_opacity_reg = torch.zeros(1, device=self.device)
+
+        loss_dict["mcmc_opacity_reg"] = mcmc_opacity_reg
 
         if self.training:
-            self.camera_optimizer.get_loss_dict(ld)
-            self.camera_velocity_optimizer.get_loss_dict(ld)
+            # Add loss from camera optimizer
+            self.camera_optimizer.get_loss_dict(loss_dict)
+            self.camera_velocity_optimizer.get_loss_dict(loss_dict)
 
         if "raster_pts" in batch:
-            p, g = self.filter_lidar_pred_and_gt(outputs, batch)
-            ul = self.depth_loss(p["depth"], g["depth"])
-            q = torch.quantile(ul, self.config.depth_loss_quantile_threshold)
-            qm = ul < q
-            ld["depth_loss"] = self.config.depth_lambda * (ul * qm).mean()
-            ld["intensity_loss"] = self.config.intensity_lambda * self.intensity_loss(
-                p["intensity"] * qm, g["intensity"] * qm
+            pred, gt = self.filter_lidar_pred_and_gt(outputs, batch)
+
+            unreduced_depth_loss = self.depth_loss(pred["depth"], gt["depth"])
+            quantile = torch.quantile(unreduced_depth_loss, self.config.depth_loss_quantile_threshold)
+            quantile_mask = unreduced_depth_loss < quantile
+            loss_dict["depth_loss"] = self.config.depth_lambda * torch.mean(unreduced_depth_loss * quantile_mask)
+
+            loss_dict["intensity_loss"] = self.config.intensity_lambda * self.intensity_loss(
+                pred["intensity"] * quantile_mask,
+                gt["intensity"] * quantile_mask,
             )
-            ld["ray_drop_loss"] = self.config.ray_drop_lambda * self.ray_drop_loss(
-                p["ray_drop"], g["ray_drop"].to(p["ray_drop"])
+            loss_dict["ray_drop_loss"] = self.config.ray_drop_lambda * self.ray_drop_loss(
+                pred["ray_drop"],
+                gt["ray_drop"].to(pred["ray_drop"]),
             )
-            if "alpha_sum_until_points" in p and self.config.line_of_sight_lambda > 0:
-                ld["alpha_sum_until_points_loss"] = (
-                    self.config.line_of_sight_lambda * (p["alpha_sum_until_points"] * qm).mean()
+
+            if "alpha_sum_until_points" in pred and self.config.line_of_sight_lambda > 0:
+                loss_dict["alpha_sum_until_points_loss"] = self.config.line_of_sight_lambda * torch.mean(
+                    pred["alpha_sum_until_points"] * quantile_mask
                 )
 
-        # Innovation 1: fog regularisation
-        if self.config.use_dual_stream and self.raw_fog_beta is not None:
-            eb = F.softplus(self.raw_fog_beta) + self.config.fog_beta_min
-            ld["fog_beta_reg"] = (eb ** 2) * self.config.fog_beta_reg
-
-            fog_A = torch.sigmoid(self.fog_atmospheric_light)
-            target = torch.tensor(self.config.fog_atmospheric_light_target, device=self.device)
-            ld["fog_A_reg"] = ((fog_A - target) ** 2).mean() * self.config.fog_atmospheric_light_reg
-
-            # Weak t_map supervision (solid surfaces only, alpha > 0.7)
-            if (
-                self.training
-                and self.config.t_map_reg_lambda > 0
-                and "t_map" in outputs
-                and "depth" in outputs
-                and outputs["depth"] is not None
-            ):
-                t_map = outputs["t_map"]   # [1,H,W,1] or [H,W,1]
-                rd_ts = outputs["depth"].detach()
-                if rd_ts.dim() == 3:
-                    rd_ts = rd_ts.squeeze(-1)   # [H,W]
-                accum = outputs.get("accumulation")   # [H,W]
-                if accum is not None and accum.dim() == 2:
-                    mask = (accum > 0.7).float().unsqueeze(-1)   # [H,W,1]
-                    # Crop to common size if needed
-                    if t_map.shape[:2] != mask.shape[:2]:
-                        t_map = t_map[: mask.shape[0], : mask.shape[1]]
-                        rd_ts = rd_ts[: mask.shape[0], : mask.shape[1]]
-                    if t_map.dim() == 3 and t_map.shape[-1] == 1:
-                        t_map = t_map.squeeze(-1)   # [H,W]
-                    t_depth = torch.exp(-eb.detach() * rd_ts.clamp(min=0.5))
-                    ld["t_map_reg"] = self.config.t_map_reg_lambda * (
-                        (torch.abs(t_map - t_depth) * mask.squeeze(-1)).sum()
-                        / mask.sum().clamp(min=1.0)
-                    )
-
-        # Innovation 2: LiDAR offset regularisation
-        if self.config.use_lidar_offset:
-            ld["lidar_offset_reg"] = (
-                (self.gauss_params["lidar_offsets"] ** 2).mean() * self.config.lidar_offset_reg
-            )
-        return ld
+        return loss_dict
 
     @torch.no_grad()
-    def get_outputs_for_camera(self, camera, obb_box=None):
-        return self.get_outputs(camera.to(self.device))
+    def get_outputs_for_camera(
+        self, camera: Union[Cameras, Lidars], obb_box: Optional[OrientedBox] = None
+    ) -> Dict[str, torch.Tensor]:
+        """Takes in a camera, generates the raybundle, and computes the output of the model.
+        Overridden for a camera-based gaussian model.
 
-    def get_image_metrics_and_images(self, outputs, batch):
-        imd, med = {}, {}
+        Args:
+            camera: generates raybundle
+        """
+        assert camera is not None, "must provide camera to gaussian model"
+        outs = self.get_outputs(camera.to(self.device))
+        return outs  # type: ignore
+
+    def get_image_metrics_and_images(
+        self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
+    ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
+        """Writes the test image outputs.
+
+        Args:
+            image_idx: Index of the image.
+            step: Current step.
+            batch: Batch of data.
+            outputs: Outputs of the model.
+
+        Returns:
+            A dictionary of metrics.
+        """
+        images_dict = {}
+        metrics_dict = {}
         if "image" in batch:
-            gt = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
-            pr = outputs["rgb"]
-            if gt.shape[:2] != pr.shape[:2]:
-                gt = gt[: pr.shape[0], : pr.shape[1]]
-            imd["img"] = torch.cat([gt, pr], 1)
-            gt4, pr4 = torch.moveaxis(gt, -1, 0)[None, ...], torch.moveaxis(pr, -1, 0)[None, ...]
-            med.update(
-                psnr=float(self.psnr(gt4, pr4)),
-                ssim=float(self.ssim(gt4, pr4)),
-                lpips=float(self.lpips(gt4, pr4)),
-            )
-        if "raster_pts" in batch:
-            p, g = self.filter_lidar_pred_and_gt(outputs, batch, output_point_cloud=True)
-            vn = g["valid"].sum()
-            ra = (
-                float((((p["ray_drop"].sigmoid() > 0.5) == g["ray_drop"]) * g["valid"]).sum() / vn)
-                if vn > 0
-                else 0.0
-            )
-            med.update(
-                depth_median_l2=float(self.median_l2(p["depth"], g["depth"])),
-                depth_mean_rel_l2=float(self.mean_rel_l2(p["depth"], g["depth"])),
-                median_depth_median_l2=float(self.median_l2(p["median_depth"], g["depth"])),
-                median_depth_mean_rel_l2=float(self.mean_rel_l2(p["median_depth"], g["depth"])),
-                intensity_rmse=float(self.rmse(p["intensity"], g["intensity"])),
-                ray_drop_accuracy=ra,
-            )
-        return med, imd
+            gt_rgb = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
+            predicted_rgb = outputs["rgb"]
 
-    def _get_appearance_embedding(self, sensor, features):
-        md = sensor.metadata if sensor.metadata is not None else {}
-        si = md.get("sensor_idxs", None)
-        if si is None:
-            assert not self.training
-            si = torch.full((1,), self.fallback_sensor_idx.value, device=features.device, dtype=torch.long)
-        return self.appearance_embedding(si).expand(*features.shape[:-1], -1)
+            # slice gt_rgb to same shape as predicted_rgb
+            if not gt_rgb.shape[:2] == predicted_rgb.shape[:2]:
+                gt_rgb = gt_rgb[: predicted_rgb.shape[0], : predicted_rgb.shape[1], :]
+                # raise user warning
+                warnings.warn("GT image and predicted image have different shapes. Cropping GT image to match.")
+
+            combined_rgb = torch.cat([gt_rgb, predicted_rgb], dim=1)
+
+            # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
+            gt_rgb = torch.moveaxis(gt_rgb, -1, 0)[None, ...]
+            predicted_rgb = torch.moveaxis(predicted_rgb, -1, 0)[None, ...]
+
+            psnr = self.psnr(gt_rgb, predicted_rgb)
+            ssim = self.ssim(gt_rgb, predicted_rgb)
+            lpips = self.lpips(gt_rgb, predicted_rgb)
+
+            # all of these metrics will be logged as scalars
+            metrics_dict.update({"psnr": float(psnr), "ssim": float(ssim), "lpips": float(lpips)})  # type: ignore
+
+            images_dict.update({"img": combined_rgb})
+
+        if "raster_pts" in batch:
+            pred, gt = self.filter_lidar_pred_and_gt(outputs, batch, output_point_cloud=True)
+
+            metrics_dict["depth_median_l2"] = float(self.median_l2(pred["depth"], gt["depth"]))
+            metrics_dict["depth_mean_rel_l2"] = float(self.mean_rel_l2(pred["depth"], gt["depth"]))
+            metrics_dict["median_depth_median_l2"] = float(self.median_l2(pred["median_depth"], gt["depth"]))
+            metrics_dict["median_depth_mean_rel_l2"] = float(self.mean_rel_l2(pred["median_depth"], gt["depth"]))
+            metrics_dict["intensity_rmse"] = float(self.rmse(pred["intensity"], gt["intensity"]))
+            metrics_dict["ray_drop_accuracy"] = float(
+                (((pred["ray_drop"].sigmoid() > 0.5) == gt["ray_drop"]) * gt["valid"]).sum() / gt["valid"].sum()
+            )
+
+            if pred["point_cloud"].shape[0] > 0 and gt["point_cloud"].shape[0] > 0:
+                metrics_dict["chamfer_distance"] = float(self.chamfer_distance(pred["point_cloud"], gt["point_cloud"]))
+
+            if pred["median_point_cloud"].shape[0] > 0 and gt["point_cloud"].shape[0] > 0:
+                metrics_dict["median_chamfer_distance"] = float(
+                    self.chamfer_distance(pred["median_point_cloud"], gt["point_cloud"])
+                )
+
+        return metrics_dict, images_dict
+
+    def _get_appearance_embedding(self, sensor: Union[Cameras, Lidars], features: torch.Tensor) -> torch.Tensor:
+        metadata = sensor.metadata if sensor.metadata is not None else {}
+        sensor_idx = metadata.get("sensor_idxs", None)
+        if sensor_idx is None:
+            assert not self.training, "Sensor sensor_idx must be present in metadata during training"
+            sensor_idx = torch.full((1,), self.fallback_sensor_idx.value, device=features.device, dtype=torch.long)
+
+        embed = self.appearance_embedding(sensor_idx).expand(*features.shape[:-1], -1)
+        return embed
