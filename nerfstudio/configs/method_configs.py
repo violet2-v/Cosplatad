@@ -1,558 +1,283 @@
-# Copyright 2024 the authors of NeuRAD and contributors.
-# Copyright 2022 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+<p align="center">
+    <a href="https://research.zenseact.com/publications/neurad/"><img src="https://img.shields.io/badge/NeuRAD-Project-ffa"/></a>
+    <a href="https://research.zenseact.com/publications/splatad/"><img src="https://img.shields.io/badge/SplatAD-Project-ffa"/></a>
+    <a href="https://arxiv.org/abs/2311.15260"><img src='https://img.shields.io/badge/NeuRAD-Arxiv-aff'></a>
+    <a href="https://arxiv.org/abs/2411.16816"><img src='https://img.shields.io/badge/SplatAD-Arxiv-aff'></a>
+</p>
 
-"""
-Put all the method implementations in one location.
-"""
+<div align="center">
+<picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/_static/imgs/neurad_logo_with_text_dark.png" />
+    <img alt="neurad logo" src="docs/_static/imgs/neurad_logo_with_text.png" width="80%"/>
+</picture>
+</div>
 
-from __future__ import annotations
+<div align="center">
+<h3 style="font-size:2.0em;">Neural Rendering for Autonomous Driving</h3>
+<h4>CVPR 2024 highlight + CVPR 2025  &nbsp;|&nbsp;  + Zero-Shot Dehazing</h4>
+</div>
 
-from collections import OrderedDict
-from copy import deepcopy
-from typing import Dict, Union
+# About
 
-import tyro
+This repository is built on [neurad-studio](https://github.com/georghess/neurad-studio), the official code release of:
 
-from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig, ScaledCameraOptimizerConfig
-from nerfstudio.configs.base_config import LoggingConfig, ViewerConfig
-from nerfstudio.configs.external_methods import ExternalMethodDummyTrainerConfig, get_external_methods
-from nerfstudio.data.datamanagers.ad_datamanager import ADDataManagerConfig
-from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanagerConfig
-from nerfstudio.data.datamanagers.full_images_lidar_datamanager import FullImageLidarDatamanagerConfig
-from nerfstudio.data.datamanagers.parallel_datamanager import ParallelDataManagerConfig
-from nerfstudio.data.dataparsers.pandaset_dataparser import PandaSetDataParserConfig
-from nerfstudio.engine.optimizers import AdamOptimizerConfig, AdamWOptimizerConfig, RAdamOptimizerConfig
-from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
-from nerfstudio.engine.trainer import TrainerConfig
-from nerfstudio.models.lidar_nerfacto import LidarNerfactoModelConfig
-from nerfstudio.models.nerfacto import NerfactoModelConfig
-from nerfstudio.models.neurad import NeuRADModelConfig
-from nerfstudio.models.splatad import SplatADModelConfig
-from nerfstudio.models.cosplat import SplatADModelConfig as CoSplatModelConfig
-from nerfstudio.models.splatfacto import SplatfactoModelConfig
-from nerfstudio.pipelines.ad_pipeline import ADPipelineConfig
-from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
-from nerfstudio.pipelines.splatad_pipeline import SplatADPipelineConfig
-from nerfstudio.plugins.registry import discover_methods
+- CVPR 2024 [paper](https://arxiv.org/abs/2311.15260) *NeuRAD: Neural Rendering for Autonomous Driving*
+- CVPR 2025 [paper](https://arxiv.org/abs/2411.16816) *SplatAD: Real-Time Lidar and Camera Rendering with 3D Gaussian Splatting for Autonomous Driving*
 
-method_configs: Dict[str, Union[TrainerConfig, ExternalMethodDummyTrainerConfig]] = {}
-descriptions = {
-    "nerfacto": "Nerfstudio's default model.",
-    "nerfacto-lidar": "Nerfstudio with lidar supervision.",
-    "splatfacto": "Gaussian Splatting model for static scenes",
-    "neurad": "Continuously improving version of NeuRAD.",
-    "neurad-paper": "NeuRAD with settings matching the paper.",
-    "splatad": "Gaussian Splatting model for autonomous driving",
-    "cosplat": "Gaussian Splatting model with dual-stream dehazing for autonomous driving",
+**CoSplat** extends SplatAD with zero‑shot dehazing for foggy autonomous driving scenes. It introduces a per‑Gaussian atmospheric scattering model (ASM) that decomposes foggy scenes into a clean surface stream and a volumetric environment stream, enabling dehazed rendering at inference without any clean‑image supervision. Two independent architecture flags support systematic ablation studies — see [CoSplat](#cosplat) below.
+
+CoSplat is a standalone method (`ns-train cosplat ...`) implemented in [`nerfstudio/models/cosplat.py`](nerfstudio/models/cosplat.py). The vanilla `splatad` baseline remains untouched for fair comparison.
+
+<div align="center">
+<a href="https://zenseact.com/"><picture style="padding-left:10px;padding-right:10px;"><source media="(prefers-color-scheme:dark)" srcset="docs/_static/imgs/ZEN_Vertical_logo_white.svg"/><img alt="zenseact" src="docs/_static/imgs/ZEN_Vertical_logo_black.svg" height="100px"/></picture></a>
+<a href="https://www.chalmers.se/en/"><picture style="padding-left:10px;padding-right:10px;padding-bottom:10px;"><source media="(prefers-color-scheme:dark)" srcset="docs/_static/imgs/EN_Avancez_CH_white.png"/><img alt="chalmers" src="docs/_static/imgs/EN_Avancez_CH_black.png" height="90px"/></picture></a>
+<a href="https://www.lunduniversity.lu.se/"><picture style="padding-left:10px;padding-right:10px;"><source media="(prefers-color-scheme:dark)" srcset="docs/_static/imgs/LundUniversity_C2line_NEG.png"/><img alt="lund" src="docs/_static/imgs/LundUniversity_C2line_BLACK.png" height="100px"/></picture></a>
+<a href="https://liu.se/en"><picture style="padding-left:10px;padding-right:10px;"><source media="(prefers-color-scheme:dark)" srcset="docs/_static/imgs/LiU_secondary_1_white-PNG.png"/><img alt="liu" src="docs/_static/imgs/LiU_secondary_1_black-PNG.png" height="100px"/></picture></a>
+<a href="https://wasp-sweden.org/"><picture><source media="(prefers-color-scheme:dark)" srcset="docs/_static/imgs/WASP-logotype-white.png"/><img alt="wasp" src="docs/_static/imgs/WASP_logotyp_grey_180116.png" height="80px"/></picture></a>
+</div>
+
+# News
+
+[June 2025] Code for [SplatAD](https://research.zenseact.com/publications/splatad/) released in neurad-studio. Uses our custom [gsplat fork](https://github.com/carlinds/splatad). Apptainer users: see [`apptainer_recipe`](apptainer_recipe).
+
+[2025] **CoSplat** added — zero‑shot fog removal for autonomous driving via bias‑driven per‑Gaussian ASM + LiDAR residual offsets.
+
+# Quickstart
+
+## 1. Installation
+
+### Prerequisites
+
+NVIDIA GPU with CUDA 11.7/11.8. See [CUDA install guide](https://docs.nvidia.com/cuda/cuda-quick-start-guide/index.html).
+
+### Create environment
+
+```bash
+conda create --name neurad -y python=3.10
+conda activate neurad
+pip install --upgrade pip
+```
+
+### Dependencies
+
+```bash
+# PyTorch with CUDA 11.8
+pip install torch==2.0.1+cu118 torchvision==0.15.2+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
+conda install -c "nvidia/label/cuda-11.8.0" cuda-toolkit
+pip install dill --upgrade
+pip install --upgrade pip "setuptools<70.0"
+pip install ninja git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
+```
+
+### Install neurad-studio
+
+```bash
+git clone https://github.com/<your-username>/neurad-studio.git
+cd neurad-studio
+pip install -e .
+```
+
+### Install gsplat fork (required for SplatAD / CoSplat)
+
+```bash
+pip install git+https://github.com/carlinds/splatad.git
+```
+
+## 2. Training
+
+### Data preparation
+
+Download PandaSet and unzip under `data/pandaset`.
+
+For foggy scene training with CoSplat, add synthetic fog via the Koschmieder atmospheric scattering model:
+
+```bash
+# PandaSet (β=0.01 light fog)
+python scripts/add_fog_pandaset.py \
+    --data data/pandaset --seq 001 --beta 0.01 --output data/pandaset_fog
+
+# nuScenes (β=0.01 light fog)
+python scripts/add_fog_nuscenes.py \
+    --data data/nuscenes --version v1.0-trainval --beta 0.01 --output data/nuscenes_fog
+```
+
+### Training commands
+
+CoSplat is registered as a standalone method that inherits the full `splatad` pipeline and optimizer configuration.
+
+> Note: models trained with the previous `splatad` method name (with CoSplat code) remain fully usable — checkpoint configs are self-contained and evaluate with the same scripts.
+
+```bash
+# Train vanilla SplatAD (no fog)
+ns-train splatad pandaset-data --data data/pandaset
+
+# Train CoSplat (zero-shot dehazing, β=0.01 light fog)
+ns-train cosplat pandaset-data \
+    --data data/pandaset_fog --sequence 001 \
+    --pipeline.model.fog-beta-init 0.04 --pipeline.model.fog-beta-min 0.03
+
+# Train CoSplat (β=0.02 moderate fog)
+ns-train cosplat pandaset-data \
+    --data data/pandaset_fog --sequence 001 \
+    --pipeline.model.fog-beta-init 0.05 --pipeline.model.fog-beta-min 0.04
+```
+
+### CoSplat ablation studies
+
+Two independent toggles allow systematic evaluation:
+
+```bash
+# Baseline (vanilla SplatAD — no innovations)
+ns-train cosplat pandaset-data --data data/pandaset_fog --sequence 001 \
+    --pipeline.model.use-dual-stream False --pipeline.model.use-lidar-offset False
+
+# +ASM only (Innovation 1 — per-Gaussian transmission map)
+ns-train cosplat pandaset-data --data data/pandaset_fog --sequence 001 \
+    --pipeline.model.use-dual-stream True --pipeline.model.use-lidar-offset False
+
+# +Offset only (Innovation 2 — LiDAR residual offsets)
+ns-train cosplat pandaset-data --data data/pandaset_fog --sequence 001 \
+    --pipeline.model.use-dual-stream False --pipeline.model.use-lidar-offset True
+
+# Full model (both innovations, β=0.01)
+ns-train cosplat pandaset-data --data data/pandaset_fog --sequence 001 \
+    --pipeline.model.fog-beta-init 0.04 --pipeline.model.fog-beta-min 0.03
+```
+
+Expected ablation results (PandaSet, β=0.01):
+
+| Configuration | Dehaze PSNR↑ | Dehaze SSIM↑ | Dehaze LPIPS↓ |
+| --- | --- | --- | --- |
+| Baseline | 13.68 | 0.696 | 0.286 |
+| +ASM only | 19.29 | 0.749 | 0.237 |
+| +Offset only | 13.71 | 0.696 | 0.285 |
+| Full model | 19.54 | 0.752 | 0.236 |
+
+## 3. Evaluation
+
+Dedicated evaluation scripts compare the dehazed output against clean ground‑truth images (PSNR / SSIM / LPIPS):
+
+```bash
+# PandaSet
+python eval_dehaze_full.py \
+    --load-config outputs/cosplat/EXP_NAME/config.yml \
+    --clean-gt-dir data/pandaset/001 \
+    --output-dir ./eval_results/ --max-vis 10
+
+# nuScenes
+python eval_dehaze_nuscenes.py \
+    --load-config outputs/cosplat/EXP_NAME/config.yml \
+    --clean-data-root data/nuscenes \
+    --output-dir ./eval_nuscenes/ --max-vis 10
+```
+
+Output: `dehaze_metrics.json`, 4‑panel visual comparisons, and a `summary_grid.png` overview.
+
+## 4. CoSplat
+
+CoSplat achieves zero‑shot dehazing on foggy autonomous driving data through two architectural innovations:
+
+**Innovation 1 — Per‑Gaussian Atmospheric Scattering Model**
+
+Each Gaussian primitive is assigned a transmission $t_i = \exp(-\beta \cdot d_i)$ computed from its camera‑space depth $d_i$ (detached to protect geometry). A second lightweight rasterization pass renders the transmission map $t_{\text{map}}$, which is combined with the clean surface RGB via the Koschmieder model:
+
+$$I_{\text{foggy}} = J_{\text{clean}} \cdot t_{\text{map}} + A \cdot (1 - t_{\text{map}})$$
+
+Training uses only foggy images + LiDAR. At inference, the environment stream is discarded, directly rendering the clean scene.
+
+**Bias‑driven training**: The scattering coefficient lower bound $\beta_{\min}$ is set above the true fog density (≈2‑3×) to prevent the ASM decomposition from collapsing to the trivial solution $\beta \to 0$. This forces the CNN decoder to output cleaner colors.
+
+**Innovation 2 — Hierarchical LiDAR Residual Offsets**
+
+LiDAR renders use $\mu + \Delta\mu_{\text{offset}}$ while camera shares the backbone mean $\mu$. The learnable offsets absorb calibration errors and penetration noise (e.g., through glass) with minimal memory overhead — 3 extra floats per Gaussian.
+
+### Key fog parameters
+
+| Parameter | Recommended (β=0.01) | Description |
+| --- | --- | --- |
+| `fog_beta_init` | 0.04 | Initial β (before softplus + β_min) |
+| `fog_beta_min` | 0.03 | Hard lower bound; set ≈2‑3× true β |
+| `fog_beta_reg` | 0.005 | L2 reg on β (kept minimal) |
+| `fog_t_min` | 0.20 | Minimum per‑Gaussian transmission |
+| `fog_atmospheric_light_reg` | 0.05 | L2 reg pulling A toward (0.95,0.95,0.95) |
+| `render_weather` | True | Set False for zero‑shot dehazed rendering |
+| `ssim_lambda` | 0.30 | SSIM loss weight |
+
+For β=0.02 moderate fog, change only `fog_beta_init=0.05` and `fog_beta_min=0.04`. All other parameters stay identical.
+
+### Dehazing results
+
+| Dataset, β | Method | PSNR↑ | SSIM↑ | LPIPS↓ |
+| --- | --- | --- | --- | --- |
+| PandaSet, 0.01 | SplatAD (baseline) | 13.68 | 0.696 | 0.286 |
+| PandaSet, 0.01 | CoSplat | 19.54 | 0.752 | 0.236 |
+| PandaSet, 0.02 | SplatAD (baseline) | 11.18 | 0.651 | 0.350 |
+| PandaSet, 0.02 | CoSplat | 16.51 | 0.730 | 0.264 |
+| nuScenes, 0.01 | SplatAD (baseline) | 13.83 | 0.705 | 0.433 |
+| nuScenes, 0.01 | CoSplat | 19.13 | 0.737 | 0.381 |
+| nuScenes, 0.02 | SplatAD (baseline) | 9.973 | 0.629 | 0.581 |
+| nuScenes, 0.02 | CoSplat | 14.58 | 0.683 | 0.458 |
+
+CoSplat consistently improves PSNR by ≈5 dB across both datasets and fog densities, without ever seeing a clean image during training.
+
+### Limitations
+
+- Residual haze on object boundaries due to alpha‑blending of multiple Gaussian transmissions in $t_{\text{map}}$. Can be mitigated by higher Gaussian density or LiDAR true‑depth supervision.
+- Sky regions rely on sparse Gaussian coverage; extreme lighting may introduce color artefacts.
+- Real fog has spatial non‑uniformity not captured by a global $\beta$. Extending β to a spatially‑adaptive parameter is future work.
+
+# Available models
+
+| Model | Type | Description |
+| --- | --- | --- |
+| `splatad` | 3DGS | CVPR 2025 — real‑time camera + lidar rendering |
+| `cosplat` | 3DGS | Zero‑shot dehazing in `cosplat.py`; β=0.01 defaults, override for other fog densities |
+| `neurad` | NeRF | CVPR 2024 highlight — SOTA NeRF for AD scenes |
+| `unisim` | NeRF | Unofficial UniSim implementation (see plugin repo) |
+
+All trained via `ns-train <method> pandaset-data --data <path>`.
+
+# Key features
+
+- Dataparsers for PandaSet, nuScenes, ZOD, Argoverse 2, KITTIMOT, Waymo v2
+- Lidar rendering (3D point clouds + intensity + ray drop modeling)
+- Rolling shutter compensation for camera and lidar
+- Dynamic actor modeling with scene graph decomposition
+- Zero‑shot dehazing via surface‑environment dual‑stream 3DGS
+- Independent ablation toggles for systematic evaluation
+
+# Built On
+
+# Citation
+
+```bibtex
+@inproceedings{tonderski2024neurad,
+  title={{NeuRAD}: Neural rendering for autonomous driving},
+  author={Tonderski, Adam and Lindstr{\"o}m, Carl and Hess, Georg and Ljungbergh, William and Svensson, Lennart and Petersson, Christoffer},
+  booktitle={CVPR}, pages={14895--14904}, year={2024}
 }
 
-method_configs["nerfacto"] = TrainerConfig(
-    method_name="nerfacto",
-    steps_per_eval_batch=100,
-    steps_per_eval_image=500,
-    steps_per_save=2000,
-    max_num_iterations=30000,
-    mixed_precision=True,
-    pipeline=VanillaPipelineConfig(
-        datamanager=ParallelDataManagerConfig(
-            dataparser=PandaSetDataParserConfig(),
-            train_num_rays_per_batch=4096,
-            eval_num_rays_per_batch=4096,
-        ),
-        model=NerfactoModelConfig(
-            eval_num_rays_per_chunk=1 << 15,
-            average_init_density=0.01,
-            camera_optimizer=CameraOptimizerConfig(mode="SO3xR3"),
-        ),
-    ),
-    optimizers={
-        "proposal_networks": {
-            "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=0.0001, max_steps=200000),
-        },
-        "fields": {
-            "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=0.0001, max_steps=200000),
-        },
-        "camera_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=5000),
-        },
-    },
-    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-    vis="viewer",
-)
+@inproceedings{hess2024splatad,
+  title={{SplatAD}: Real-Time Lidar and Camera Rendering with 3D Gaussian Splatting for Autonomous Driving},
+  author={Hess, Georg and Lindstr{\"o}m, Carl and Fatemi, Maryam and Petersson, Christoffer and Svensson, Lennart},
+  booktitle={CVPR}, year={2025}
+}
+```
 
-method_configs["nerfacto-big"] = TrainerConfig(
-    method_name="nerfacto",
-    steps_per_eval_batch=200,
-    steps_per_eval_image=500,
-    steps_per_save=2000,
-    max_num_iterations=100000,
-    mixed_precision=True,
-    pipeline=VanillaPipelineConfig(
-        datamanager=ParallelDataManagerConfig(
-            dataparser=PandaSetDataParserConfig(),
-            train_num_rays_per_batch=8192,
-            eval_num_rays_per_batch=4096,
-        ),
-        model=NerfactoModelConfig(
-            eval_num_rays_per_chunk=1 << 15,
-            num_nerf_samples_per_ray=128,
-            num_proposal_samples_per_ray=(512, 256),
-            hidden_dim=128,
-            hidden_dim_color=128,
-            appearance_embed_dim=128,
-            max_res=4096,
-            proposal_weights_anneal_max_num_iters=5000,
-            log2_hashmap_size=21,
-            average_init_density=0.01,
-            camera_optimizer=CameraOptimizerConfig(mode="SO3xR3"),
-        ),
-    ),
-    optimizers={
-        "proposal_networks": {
-            "optimizer": RAdamOptimizerConfig(lr=1e-2, eps=1e-15),
-            "scheduler": None,
-        },
-        "fields": {
-            "optimizer": RAdamOptimizerConfig(lr=1e-2, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=50000),
-        },
-        "camera_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=5000),
-        },
-    },
-    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-    vis="viewer",
-)
+If you use the CoSplat extension, please cite the CoSplat paper (to appear).
 
-method_configs["nerfacto-huge"] = TrainerConfig(
-    method_name="nerfacto",
-    steps_per_eval_batch=200,
-    steps_per_eval_image=500,
-    steps_per_save=2000,
-    max_num_iterations=100000,
-    mixed_precision=True,
-    pipeline=VanillaPipelineConfig(
-        datamanager=ParallelDataManagerConfig(
-            dataparser=PandaSetDataParserConfig(),
-            train_num_rays_per_batch=8192,
-            eval_num_rays_per_batch=4096,
-        ),
-        model=NerfactoModelConfig(
-            eval_num_rays_per_chunk=1 << 15,
-            num_nerf_samples_per_ray=64,
-            num_proposal_samples_per_ray=(512, 512),
-            proposal_net_args_list=[
-                {"hidden_dim": 16, "log2_hashmap_size": 17, "num_levels": 5, "max_res": 512, "use_linear": False},
-                {"hidden_dim": 16, "log2_hashmap_size": 17, "num_levels": 7, "max_res": 2048, "use_linear": False},
-            ],
-            hidden_dim=256,
-            hidden_dim_color=256,
-            appearance_embed_dim=32,
-            max_res=8192,
-            proposal_weights_anneal_max_num_iters=5000,
-            log2_hashmap_size=21,
-            average_init_density=0.01,
-            camera_optimizer=CameraOptimizerConfig(mode="SO3xR3"),
-        ),
-    ),
-    optimizers={
-        "proposal_networks": {
-            "optimizer": RAdamOptimizerConfig(lr=1e-2, eps=1e-15),
-            "scheduler": None,
-        },
-        "fields": {
-            "optimizer": RAdamOptimizerConfig(lr=1e-2, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=50000),
-        },
-        "camera_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=5000),
-        },
-    },
-    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-    vis="viewer",
-)
+---
 
-method_configs["nerfacto-lidar"] = TrainerConfig(
-    method_name="nerfacto-lidar",
-    steps_per_eval_batch=200,
-    steps_per_eval_image=500,
-    steps_per_save=2000,
-    max_num_iterations=30000,
-    mixed_precision=True,
-    pipeline=ADPipelineConfig(
-        datamanager=ADDataManagerConfig(dataparser=PandaSetDataParserConfig()),
-        calc_fid_steps=(99999999,),
-        model=LidarNerfactoModelConfig(
-            eval_num_rays_per_chunk=1 << 15,
-            camera_optimizer=CameraOptimizerConfig(mode="SO3xR3"),
-        ),
-    ),
-    optimizers={
-        "proposal_networks": {
-            "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
-            "scheduler": None,
-        },
-        "fields": {
-            "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
-            "scheduler": None,
-        },
-        "cam_opt": {
-            "optimizer": AdamOptimizerConfig(lr=6e-4, eps=1e-15),
-            "scheduler": None,
-        },
-    },
-    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-    vis="viewer",
-)
+## 相比之前 README 的修改汇总
 
-method_configs["splatfacto"] = TrainerConfig(
-    method_name="splatfacto",
-    steps_per_eval_image=100,
-    steps_per_eval_batch=100,
-    steps_per_save=2000,
-    steps_per_eval_all_images=1000,
-    max_num_iterations=30000,
-    mixed_precision=False,
-    pipeline=VanillaPipelineConfig(
-        datamanager=FullImageDatamanagerConfig(
-            dataparser=PandaSetDataParserConfig(sequence="028"),  # use static sequence
-            cache_images_type="uint8",
-        ),
-        model=SplatfactoModelConfig(),
-    ),
-    optimizers={
-        "means": {
-            "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1.6e-6, max_steps=30000),
-        },
-        "features_dc": {"optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15), "scheduler": None},
-        "features_rest": {"optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15), "scheduler": None},
-        "opacities": {"optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15), "scheduler": None},
-        "scales": {"optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15), "scheduler": None},
-        "quats": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
-        "camera_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-7, max_steps=30000),
-        },
-    },
-    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-    vis="viewer",
-)
+| 位置 | 修改 |
+| --- | --- |
+| About | 方法名从 `splatad` 改为独立注册的 `cosplat` |
+| Training commands | 全部 `ns-train splatad` → `ns-train cosplat`（针对 CoSplat 场景） |
+| Ablation commands | 同上 |
+| Parameter table | **删除** `t_map_reg_lambda` 和 `depth_weighted_loss_lambda` 两行（未生效的 loss） |
+| Evaluation | `outputs/splatad/` → `outputs/cosplat/` |
+| Available models 表 | 更新 `cosplat` 行的描述 |
+| Limitations | 删除 `fog_sky_depth` 相关描述（最终版代码中已无该参数） |
 
-method_configs["splatfacto-big"] = TrainerConfig(
-    method_name="splatfacto",
-    steps_per_eval_image=100,
-    steps_per_eval_batch=100,
-    steps_per_save=2000,
-    steps_per_eval_all_images=1000,
-    max_num_iterations=30000,
-    mixed_precision=False,
-    pipeline=VanillaPipelineConfig(
-        datamanager=FullImageDatamanagerConfig(
-            dataparser=PandaSetDataParserConfig(sequence="028"),  # use static sequence
-            cache_images_type="uint8",
-        ),
-        model=SplatfactoModelConfig(
-            cull_alpha_thresh=0.005,
-        ),
-    ),
-    optimizers={
-        "means": {
-            "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1.6e-6, max_steps=30000),
-        },
-        "features_dc": {"optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15), "scheduler": None},
-        "features_rest": {"optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15), "scheduler": None},
-        "opacities": {"optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15), "scheduler": None},
-        "scales": {"optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15), "scheduler": None},
-        "quats": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
-        "camera_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-5, max_steps=30000),
-        },
-    },
-    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-    vis="viewer",
-)
-
-# ══════════════════════════════════════════════════════════════
-# SplatAD — vanilla baseline (original optimizer configuration)
-# ══════════════════════════════════════════════════════════════
-method_configs["splatad"] = TrainerConfig(
-    method_name="splatad",
-    steps_per_eval_image=500,
-    steps_per_eval_batch=100,
-    steps_per_save=2000,
-    steps_per_eval_all_images=2500,
-    max_num_iterations=30001,
-    mixed_precision=False,
-    pipeline=SplatADPipelineConfig(
-        calc_fid_steps=(30000,),
-        datamanager=FullImageLidarDatamanagerConfig(
-            dataparser=PandaSetDataParserConfig(add_missing_points=True),
-            cache_images_type="uint8",
-        ),
-        model=SplatADModelConfig(max_steps=30001),
-    ),
-    optimizers={
-        "means": {
-            "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1.6e-6, max_steps=30000),
-        },
-        "features_dc": {"optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15), "scheduler": None},
-        "features_rest": {"optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15), "scheduler": None},
-        "opacities": {"optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15), "scheduler": None},
-        "scales": {"optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15), "scheduler": None},
-        "quats": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
-        "camera_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-7, max_steps=30000),
-        },
-        "camera_velocity_opt_linear": {
-            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-6, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0),
-        },
-        "camera_velocity_opt_angular": {
-            "optimizer": AdamOptimizerConfig(lr=2e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-7, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0),
-        },
-        "camera_velocity_opt_time_to_center_pixel": {
-            "optimizer": AdamOptimizerConfig(lr=2e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-7, max_steps=30000, warmup_steps=10000, lr_pre_warmup=0),
-        },
-        "trajectory_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=20001, warmup_steps=2500),
-        },
-        "fields": {
-            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15, weight_decay=1e-6),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-3, max_steps=20001, warmup_steps=500),
-        },
-    },
-    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-    vis="viewer",
-)
-
-# ══════════════════════════════════════════════════════════════
-# CoSplat — zero-shot dehazing (defaults tuned for β=0.01 light fog;
-# override fog-beta-init / fog-beta-min for other densities)
-# ══════════════════════════════════════════════════════════════
-method_configs["cosplat"] = TrainerConfig(
-    method_name="cosplat",
-    steps_per_eval_image=500,
-    steps_per_eval_batch=100,
-    steps_per_save=2000,
-    steps_per_eval_all_images=2500,
-    max_num_iterations=30001,
-    mixed_precision=False,
-    pipeline=SplatADPipelineConfig(
-        calc_fid_steps=(30000,),
-        datamanager=FullImageLidarDatamanagerConfig(
-            dataparser=PandaSetDataParserConfig(add_missing_points=True),
-            cache_images_type="uint8",
-        ),
-        model=CoSplatModelConfig(
-            max_steps=30001,
-            fog_beta_init=0.04,   # β=0.01 optimal (3× bias)
-            fog_beta_min=0.03,    # β=0.01 optimal (3× bias)
-        ),
-    ),
-    optimizers={
-        "means": {
-            "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1.6e-6, max_steps=30000),
-        },
-        "features_dc": {"optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15), "scheduler": None},
-        "features_rest": {"optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15), "scheduler": None},
-        "opacities": {"optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15), "scheduler": None},
-        "scales": {"optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15), "scheduler": None},
-        "quats": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
-        "camera_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-7, max_steps=30000),
-        },
-        "camera_velocity_opt_linear": {
-            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-6, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0),
-        },
-        "camera_velocity_opt_angular": {
-            "optimizer": AdamOptimizerConfig(lr=2e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-7, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0),
-        },
-        "camera_velocity_opt_time_to_center_pixel": {
-            "optimizer": AdamOptimizerConfig(lr=2e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-7, max_steps=30000, warmup_steps=10000, lr_pre_warmup=0),
-        },
-        "trajectory_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=20001, warmup_steps=2500),
-        },
-        "fields": {
-            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15, weight_decay=1e-6),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-3, max_steps=20001, warmup_steps=500),
-        },
-        # ── Innovation 1: fog ASM parameters (β + A) ──
-        "fog_params": {
-            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=30000),
-        },
-        # ── Innovation 2: LiDAR residual offsets ──
-        "lidar_offsets": {
-            "optimizer": AdamOptimizerConfig(lr=8e-5, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=8e-7, max_steps=30000),
-        },
-    },
-    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-    vis="viewer",
-)
-
-method_configs["neurad"] = TrainerConfig(
-    method_name="neurad",
-    steps_per_eval_batch=100,
-    steps_per_eval_all_images=5000,
-    steps_per_save=2000,
-    max_num_iterations=20001,
-    mixed_precision=True,
-    pipeline=ADPipelineConfig(
-        calc_fid_steps=(99999999,),
-        datamanager=ADDataManagerConfig(dataparser=PandaSetDataParserConfig(add_missing_points=True)),
-        model=NeuRADModelConfig(
-            eval_num_rays_per_chunk=1 << 15,
-            camera_optimizer=CameraOptimizerConfig(mode="off"),  # SO3xR3
-        ),
-    ),
-    optimizers={
-        "trajectory_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=20001, warmup_steps=2500),
-        },
-        "cnn": {
-            "optimizer": AdamWOptimizerConfig(lr=1e-3, eps=1e-15, weight_decay=1e-6),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=20001, warmup_steps=2500),
-        },
-        "fields": {
-            "optimizer": AdamWOptimizerConfig(lr=1e-2, eps=1e-15, weight_decay=1e-7),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-3, max_steps=20001, warmup_steps=500),
-        },
-        "hashgrids": {
-            "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-3, max_steps=20001, warmup_steps=500),
-        },
-        "camera_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-5, max_steps=20001, warmup_steps=2500),
-        },
-    },
-    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-    vis="viewer",
-    logging=LoggingConfig(steps_per_log=100),
-)
-
-# With scaled camera optimizer (tuned for nuscenes)
-method_configs["neurad-scaleopt"] = deepcopy(method_configs["neurad"])
-method_configs["neurad-scaleopt"].method_name = "neurad-scaleopt"
-method_configs["neurad-scaleopt"].pipeline.model.camera_optimizer = ScaledCameraOptimizerConfig(
-    weights=(1.0, 1.0, 0.01, 0.01, 0.01, 1.0),  # xrot, yrot, zrot, xtrans, ytrans, ztrans
-    trans_l2_penalty=(1e-2, 1e-2, 1e-3),
-    mode="SO3xR3",
-)
-
-def _scaled_neurad_training(config: TrainerConfig, scale: float, newname: str) -> TrainerConfig:
-    config = deepcopy(config)
-    config.method_name = newname
-    config.max_num_iterations = int((config.max_num_iterations - 1) * scale + 1)
-    config.steps_per_eval_batch = int(config.steps_per_eval_batch * scale)
-    config.steps_per_eval_image = int(config.steps_per_eval_image * scale)
-    config.steps_per_eval_all_images = int(config.steps_per_eval_all_images * scale)
-    config.steps_per_save = int(config.steps_per_save * scale)
-    assert isinstance(config.pipeline, ADPipelineConfig)
-    config.pipeline.calc_fid_steps = tuple(int(scale * s) for s in config.pipeline.calc_fid_steps)
-    for optimizer in config.optimizers.values():
-        optimizer["scheduler"].max_steps = int(optimizer["scheduler"].max_steps * scale)
-        optimizer["scheduler"].warmup_steps = int(optimizer["scheduler"].warmup_steps * scale)
-    return config
-
-# Bigger, better, longer, stronger
-method_configs["neurader"] = _scaled_neurad_training(method_configs["neurad"], 2.5, "neurader")
-for optimizer in method_configs["neurader"].optimizers.values():
-    optimizer["optimizer"].lr *= 0.5
-    optimizer["scheduler"].lr_final *= 0.5
-model: NeuRADModelConfig = method_configs["neurader"].pipeline.model
-for field in (model.field, model.sampling.proposal_field_1, model.sampling.proposal_field_2):
-    field.grid.static.max_res *= 2
-    field.grid.static.base_res *= 2
-    field.grid.static.log2_hashmap_size += 1
-    field.grid.actor.log2_hashmap_size += 1
-
-method_configs["neurader-scaleopt"] = deepcopy(method_configs["neurader"])
-method_configs["neurader-scaleopt"].method_name = "neurader-scaleopt"
-method_configs["neurader-scaleopt"].pipeline.model.camera_optimizer = ScaledCameraOptimizerConfig(
-    weights=(1.0, 1.0, 0.01, 0.01, 0.01, 1.0),
-    trans_l2_penalty=(1e-2, 1e-2, 1e-3),
-    mode="SO3xR3",
-)
-
-# Even longer training
-method_configs["neuradest"] = _scaled_neurad_training(method_configs["neurader"], 3, "neuradest")
-method_configs["neuradest-scaleopt"] = _scaled_neurad_training(method_configs["neurader-scaleopt"], 3, "neuradest-scaleopt")
-
-# Configurations matching the paper (disable temporal appearance and actor flip)
-method_configs["neurad-paper"] = deepcopy(method_configs["neurad"])
-method_configs["neurad-paper"].method_name = "neurad-paper"
-method_configs["neurad-paper"].pipeline.model.use_temporal_appearance = False  # type: ignore
-for f in method_configs["neurad-paper"].pipeline.model.fields:  # type: ignore
-    f.flip_prob = 0.0
-method_configs["neurad-2x-paper"] = deepcopy(method_configs["neurader"])
-method_configs["neurad-2x-paper"].method_name = "neurad-paper"
-method_configs["neurad-2x-paper"].pipeline.model.use_temporal_appearance = False  # type: ignore
-for f in method_configs["neurad-2x-paper"].pipeline.model.fields:  # type: ignore
-    f.flip_prob = 0.0
-
-def merge_methods(methods, method_descriptions, new_methods, new_descriptions, overwrite=True):
-    """Merge new methods and descriptions into existing methods and descriptions."""
-    methods = OrderedDict(**methods)
-    method_descriptions = OrderedDict(**method_descriptions)
-    for k, v in new_methods.items():
-        if overwrite or k not in methods:
-            methods[k] = v
-            method_descriptions[k] = new_descriptions.get(k, "")
-    return methods, method_descriptions
-
-def sort_methods(methods, method_descriptions):
-    """Sort methods and descriptions by method name."""
-    methods = OrderedDict(sorted(methods.items(), key=lambda x: x[0]))
-    method_descriptions = OrderedDict(sorted(method_descriptions.items(), key=lambda x: x[0]))
-    return methods, method_descriptions
-
-all_methods, all_descriptions = method_configs, descriptions
-# Add discovered external methods
-all_methods, all_descriptions = merge_methods(all_methods, all_descriptions, *discover_methods())
-all_methods, all_descriptions = sort_methods(all_methods, all_descriptions)
-
-# Register all possible external methods which can be installed with Nerfstudio
-all_methods, all_descriptions = merge_methods(
-    all_methods, all_descriptions, *sort_methods(*get_external_methods()), overwrite=False
-)
-
-AnnotatedBaseConfigUnion = tyro.conf.SuppressFixed[
-    tyro.conf.FlagConversionOff[
-        tyro.extras.subcommand_type_from_defaults(defaults=all_methods, descriptions=all_descriptions)
-    ]
-]
+同时你还需要在 `method_configs.py` 中注册 `cosplat` 方法（参考上一轮给出的代码）。
